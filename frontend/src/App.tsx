@@ -6,6 +6,7 @@ import LogsTerminal from "./components/LogsTerminal";
 import ManagerPanel from "./components/ManagerPanel";
 import ShiftHero from "./components/ShiftHero";
 import { AppState } from "./types";
+import { API_URI, getWsUrl } from "./config";
 
 export default function App() {
   const [state, setState] = useState<AppState>({
@@ -28,12 +29,7 @@ export default function App() {
     fetchState();
 
     // Setup WebSocket live updates
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl =
-      import.meta.env.DEV
-        ? `ws://${window.location.hostname}:8000/ws`
-        : `${protocol}//${window.location.host}/ws`;
-
+    const wsUrl = getWsUrl();
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
@@ -54,7 +50,7 @@ export default function App() {
 
   const fetchState = async () => {
     try {
-      const res = await fetch("/api/state");
+      const res = await fetch(`${API_URI}/api/state`);
       if (res.ok) {
         const data = await res.json();
         setState(data);
@@ -65,22 +61,22 @@ export default function App() {
   };
 
   const handleStartRotator = async () => {
-    await fetch("/api/rotator/start", { method: "POST" });
+    await fetch(`${API_URI}/api/rotator/start`, { method: "POST" });
     fetchState();
   };
 
   const handleStopRotator = async () => {
-    await fetch("/api/rotator/stop", { method: "POST" });
+    await fetch(`${API_URI}/api/rotator/stop`, { method: "POST" });
     fetchState();
   };
 
   const handleToggleShift = async () => {
-    await fetch("/api/rotator/toggle_shift", { method: "POST" });
+    await fetch(`${API_URI}/api/rotator/toggle_shift`, { method: "POST" });
     fetchState();
   };
 
   const handleAddMessage = async (content: string) => {
-    await fetch("/api/messages", {
+    await fetch(`${API_URI}/api/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
@@ -89,12 +85,12 @@ export default function App() {
   };
 
   const handleDeleteMessage = async (id: number) => {
-    await fetch(`/api/messages/${id}`, { method: "DELETE" });
+    await fetch(`${API_URI}/api/messages/${id}`, { method: "DELETE" });
     fetchState();
   };
 
   const handleAddTarget = async (username: string) => {
-    await fetch("/api/targets", {
+    await fetch(`${API_URI}/api/targets`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username }),
@@ -103,12 +99,12 @@ export default function App() {
   };
 
   const handleDeleteTarget = async (id: number) => {
-    await fetch(`/api/targets/${id}`, { method: "DELETE" });
+    await fetch(`${API_URI}/api/targets/${id}`, { method: "DELETE" });
     fetchState();
   };
 
   const handleDeleteAccount = async (id: number) => {
-    await fetch(`/api/accounts/${id}`, { method: "DELETE" });
+    await fetch(`${API_URI}/api/accounts/${id}`, { method: "DELETE" });
     fetchState();
   };
 

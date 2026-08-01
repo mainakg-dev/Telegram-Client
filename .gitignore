@@ -4,3 +4,5 @@
 *.session
 backend/data/
 api.txt
+venv
+package-lock.json

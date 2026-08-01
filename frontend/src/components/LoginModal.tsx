@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { X, Smartphone, Key, Lock, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { API_URI } from '../config';
 
 interface LoginModalProps {
   isOpen: boolean;
@@ -33,7 +34,7 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: LoginModalPro
     setLoading(true);
 
     try {
-      const res = await fetch('/api/auth/send_code', {
+      const res = await fetch(`${API_URI}/api/auth/send_code`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -70,7 +71,7 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: LoginModalPro
     setLoading(true);
 
     try {
-      const res = await fetch('/api/auth/verify_code', {
+      const res = await fetch(`${API_URI}/api/auth/verify_code`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -112,7 +113,7 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: LoginModalPro
     setLoading(true);
 
     try {
-      const res = await fetch('/api/auth/verify_password', {
+      const res = await fetch(`${API_URI}/api/auth/verify_password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
