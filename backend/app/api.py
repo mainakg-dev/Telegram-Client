@@ -1,23 +1,20 @@
 import json
+import time
 import asyncio
+import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
+
+logger = logging.getLogger("API")
 
 from telethon import TelegramClient, errors
 from .database import init_db, get_db, set_setting, add_log, get_setting
 from .telethon_engine import engine_instance, SESSIONS_DIR
 from .rotator import rotator_instance
+from .config import DEFAULT_API_ID, DEFAULT_API_HASH
 
-app = FastAPI(title="Telegram Client Rotator API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 class ConnectionManager:
     def __init__(self):
@@ -46,15 +43,60 @@ async def ws_broadcast_adapter(data: dict):
 rotator_instance.set_broadcast_callback(ws_broadcast_adapter)
 
 pending_auths: Dict[str, Dict[str, Any]] = {}
+PENDING_AUTH_TTL_SECONDS = 600  # 10 minutes
 
-@app.on_event("startup")
-async def on_startup():
+async def cleanup_stale_pending_auths():
+    """Disconnects and removes pending auth entries older than TTL."""
+    now = time.time()
+    stale_keys = [
+        k for k, v in pending_auths.items()
+        if now - v.get("created_at", 0) > PENDING_AUTH_TTL_SECONDS
+    ]
+    for key in stale_keys:
+        entry = pending_auths.pop(key, None)
+        if entry and "client" in entry:
+            try:
+                client = entry["client"]
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                pass
+
+async def _periodic_auth_cleanup():
+    """Runs cleanup every 60 seconds."""
+    while True:
+        await asyncio.sleep(60)
+        await cleanup_stale_pending_auths()
+
+@asynccontextmanager
+async def lifespan(app):
+    # Startup
     await init_db()
-
-@app.on_event("shutdown")
-async def on_shutdown():
+    cleanup_task = asyncio.create_task(_periodic_auth_cleanup())
+    yield
+    # Shutdown
+    cleanup_task.cancel()
     if rotator_instance.is_running:
         await rotator_instance.stop()
+    for key in list(pending_auths.keys()):
+        entry = pending_auths.pop(key, None)
+        if entry and "client" in entry:
+            try:
+                client = entry["client"]
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                pass
+
+app = FastAPI(title="Telegram Client Rotator API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -68,7 +110,8 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-    except Exception:
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
 
 @app.get("/api/state")
@@ -113,16 +156,27 @@ async def send_auth_code(payload: Dict[str, Any] = Body(...)):
     if req_api_id and str(req_api_id).strip():
         api_id_val = int(req_api_id)
     else:
-        api_id_val = int(await get_setting("default_api_id", "39865871"))
+        api_id_val = int(await get_setting("default_api_id", str(DEFAULT_API_ID)))
 
     if req_api_hash and str(req_api_hash).strip():
         api_hash_val = str(req_api_hash).strip()
     else:
-        api_hash_val = str(await get_setting("default_api_hash", "2cc8fee74c199b9a912140e6e6c2e85e"))
+        api_hash_val = str(await get_setting("default_api_hash", DEFAULT_API_HASH))
 
     import os
     session_path = os.path.join(SESSIONS_DIR, session_name)
     client = TelegramClient(session_path, api_id_val, api_hash_val)
+
+    # Disconnect any existing pending client for this session before replacing
+    if session_name in pending_auths:
+        old_entry = pending_auths.pop(session_name)
+        old_client = old_entry.get("client")
+        if old_client:
+            try:
+                if old_client.is_connected():
+                    await old_client.disconnect()
+            except Exception:
+                pass
 
     try:
         await client.connect()
@@ -134,7 +188,8 @@ async def send_auth_code(payload: Dict[str, Any] = Body(...)):
             "server_group": server_group,
             "phone_code_hash": res.phone_code_hash,
             "api_id": int(api_id_val),
-            "api_hash": str(api_hash_val)
+            "api_hash": str(api_hash_val),
+            "created_at": time.time()
         }
         await add_log("AUTH_CODE_SENT", "INFO", f"Sent login code to {phone}", account_phone=phone)
         return {
@@ -284,9 +339,14 @@ async def add_target(payload: Dict[str, str] = Body(...)):
     if not username:
         raise HTTPException(status_code=400, detail="Username is required")
     
-    # Handle t.me links: e.g. t.me/mainakpriyesh -> @mainakpriyesh
-    if "t.me/" in username:
-        username = "@" + username.split("t.me/")[-1].strip("/")
+    # Handle private invite links (e.g. https://t.me/+xyz or t.me/joinchat/xyz)
+    if "+" in username or "joinchat/" in username:
+        if not username.startswith("http"):
+            username = "https://t.me/" + (username[2:] if username.startswith("t.me") else username.lstrip("/"))
+    # Handle public t.me links: e.g. t.me/groupname -> @groupname
+    elif "t.me/" in username:
+        clean_name = username.split("t.me/")[-1].strip("/")
+        username = "@" + clean_name if not clean_name.startswith("@") else clean_name
     elif not username.startswith("@"):
         username = f"@{username}"
         

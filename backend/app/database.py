@@ -2,6 +2,7 @@ import os
 import aiosqlite
 from typing import List, Dict, Any, Optional
 import contextlib
+from .config import DEFAULT_API_ID, DEFAULT_API_HASH
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.db")
 
@@ -71,52 +72,11 @@ async def init_db():
             ('current_active_server', '1'),
             ('is_rotator_running', '0'),
             ('shift_started_at', '0'),
-            ('default_api_id', '39865871'),
-            ('default_api_hash', '2cc8fee74c199b9a912140e6e6c2e85e')
+            ('default_api_id', str(DEFAULT_API_ID)),
+            ('default_api_hash', DEFAULT_API_HASH)
         ]
         for key, val in default_settings:
             await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
-
-        # Check if dummy test accounts exist, if none populate 35 sample accounts structure
-        cursor = await db.execute("SELECT COUNT(*) FROM accounts")
-        count = (await cursor.fetchone())[0]
-        if count == 0:
-            accounts_data = []
-            for i in range(1, 36):
-                group = 1 if i <= 18 else 2
-                phone = f"+1555010{i:02d}"
-                session_name = f"acc_s{group}_{i:02d}"
-                accounts_data.append((phone, session_name, group, 'RESTING', 39865871, '2cc8fee74c199b9a912140e6e6c2e85e'))
-            
-            await db.executemany("""
-                INSERT INTO accounts (phone, session_name, server_group, status, api_id, api_hash)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, accounts_data)
-
-            # Insert sample pre-defined messages
-            sample_messages = [
-                (
-                    "💥𝐘𝐨𝐮𝐓𝐮𝐛𝐞 𝐦𝐨𝐧𝐢𝐭𝐢𝐳𝐞💥\n\n"
-                    "1k subcribes:- 320 rs\n\n"
-                    "1k intragam followers:- 230 rs\n\n"
-                    "💥✅10k subcribes and 4k watchingtime and full monitize 880 rupees 💥✅\n\n"
-                    "✅ WhatsApp link click 👇👇\n"
-                    "https://wa.me/919064690454?text=Hello%20Sir\n\n"
-                    "100% real subcribes permanent ✅\n\n"
-                    "200 subcribes demo 40 rs with 100 like ✅💥\n\n"
-                    "✅ WhatsApp link click 👇👇\n"
-                    "https://wa.me/919064690454?text=Hello%20Sir",
-                    "promotional"
-                )
-            ]
-            await db.executemany("INSERT INTO messages (content, category) VALUES (?, ?)", sample_messages)
-
-            # Insert sample target group/channel
-            await db.executemany("INSERT INTO targets (username, name) VALUES (?, ?)", [
-                ("@LinX013", "Target LinX013"),
-                ("@Telegram", "Official Telegram Channel"),
-                ("@durov", "Pavel Durov Channel")
-            ])
 
         await db.commit()
 

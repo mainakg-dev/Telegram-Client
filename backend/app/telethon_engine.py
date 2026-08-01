@@ -5,6 +5,7 @@ import logging
 from typing import Any, Dict, Optional
 from telethon import TelegramClient, errors, functions, types
 from .queue_manager import queue_manager
+from .config import DEFAULT_API_ID, DEFAULT_API_HASH
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TelethonEngine")
@@ -102,8 +103,8 @@ class TelethonEngine:
                 return client
 
         # Default API credentials if account doesn't specify custom ones
-        api_id = account.get("api_id") or 39865871
-        api_hash = account.get("api_hash") or "2cc8fee74c199b9a912140e6e6c2e85e"
+        api_id = account.get("api_id") or DEFAULT_API_ID
+        api_hash = account.get("api_hash") or DEFAULT_API_HASH
 
         if not api_id or not api_hash or not session_name:
             logger.warning(f"Account {acc_id} missing credentials.")
@@ -186,12 +187,11 @@ class TelethonEngine:
             return False
 
         try:
-            # Trigger typing chat action
+            # Trigger typing chat action and send while still typing
             async with client.action(target_chat, 'typing'):
                 await asyncio.sleep(typing_duration)
-            
-            # Send message replying to specific channel post ID
-            await client.send_message(target_chat, full_message, reply_to=message_id)
+                # Send message replying to specific channel post ID
+                await client.send_message(target_chat, full_message, reply_to=message_id)
             
             await safe_db_execute("UPDATE accounts SET status = 'ACTIVE', last_message_at = CURRENT_TIMESTAMP WHERE id = ?", (acc_id,))
             await safe_add_log("AUTO_REPLY", "SUCCESS", f"Replied to msg #{message_id} with ref_{ref_num}#", phone, group, str(target_chat))
