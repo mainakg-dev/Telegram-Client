@@ -45,26 +45,30 @@ export default function ManagerPanel({
           Pre-defined Message Templates ({messages.length})
         </div>
 
-        <form onSubmit={handleAddMsg} className="input-group">
-          <input 
-            type="text" 
+        <form onSubmit={handleAddMsg} style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '16px' }}>
+          <textarea 
             className="input" 
-            placeholder="Add predefined message..." 
+            rows={4}
+            placeholder="Paste or type predefined message (multi-line supported)..." 
             value={newMsgContent}
             onChange={(e) => setNewMsgContent(e.target.value)}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit', padding: '10px' }}
           />
-          <button type="submit" className="btn btn-primary" style={{ padding: '8px 16px' }}>
-            <Plus size={16} /> Add
+          <button type="submit" className="btn btn-primary" style={{ alignSelf: 'flex-end', padding: '8px 16px' }}>
+            <Plus size={16} /> Add Message
           </button>
         </form>
 
-        <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
+        <div style={{ maxHeight: '250px', overflowY: 'auto' }}>
           {messages.map((m) => (
-            <div key={m.id} className="list-item">
-              <span style={{ color: 'white', flex: 1, paddingRight: '10px' }}>{m.content}</span>
+            <div key={m.id} className="list-item" style={{ alignItems: 'flex-start', marginBottom: '8px' }}>
+              <span style={{ color: 'white', flex: 1, paddingRight: '10px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: '0.9rem' }}>
+                {m.content}
+              </span>
               <button 
                 onClick={() => onDeleteMessage(m.id)} 
-                style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer' }}
+                style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', marginTop: '4px' }}
+                title="Delete message"
               >
                 <Trash2 size={16} />
               </button>

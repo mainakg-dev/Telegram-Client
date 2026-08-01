@@ -76,8 +76,11 @@ class DedicatedWorkerNode:
             if acc_id in self.active_listeners:
                 continue
 
-            client = await engine_instance.get_client_for_account(acc)
-            if client and await client.is_user_authorized():
+            try:
+                client = await engine_instance.get_client_for_account(acc)
+                if not client or not await client.is_user_authorized():
+                    continue
+
                 if acc_id not in self.resolved_targets:
                     self.resolved_targets[acc_id] = {}
 
@@ -94,6 +97,10 @@ class DedicatedWorkerNode:
                             await client(functions.channels.JoinChannelRequest(entity))
                         except Exception:
                             pass
+                    except (errors.AuthKeyUnregisteredError, errors.UserDeactivatedError, errors.UserDeactivatedBanError, errors.SessionRevokedError) as e:
+                        logger.error(f"Session error resolving target {t} for account {acc.get('phone')}: {e}")
+                        await engine_instance.handle_invalid_session(acc_id, client, acc.get("session_name"))
+                        break
                     except Exception as e:
                         logger.error(f"Error resolving target {t}: {e}")
 
@@ -141,6 +148,13 @@ class DedicatedWorkerNode:
                 client.add_event_handler(handler, events.NewMessage(chats=resolved_chats))
                 self.active_listeners.add(acc_id)
                 logger.info(f"✅ Active Telethon listener attached for account #{acc_id} ({acc['phone']}) on Worker Group {self.group_id}")
+
+            except (errors.AuthKeyUnregisteredError, errors.UserDeactivatedError, errors.UserDeactivatedBanError, errors.SessionRevokedError) as e:
+                logger.error(f"Session error for account #{acc_id} ({acc.get('phone')}): {e}")
+                self.active_listeners.discard(acc_id)
+                await engine_instance.handle_invalid_session(acc_id, session_name=acc.get("session_name"))
+            except Exception as e:
+                logger.error(f"Error setting up listener for account #{acc_id}: {e}")
 
     async def consumer_loop(self):
         """

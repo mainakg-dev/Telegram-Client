@@ -95,30 +95,19 @@ async def init_db():
 
             # Insert sample pre-defined messages
             sample_messages = [
-                ("""💥𝐘𝐨𝐮𝐓𝐮𝐛𝐞 𝐦𝐨𝐧𝐢𝐭𝐢𝐳𝐞💥 
-
-            1k subcribes:- 320 rs  
-
-            1k intragam followers:- 230 rs  
-
-            💥✅10k subcribes and 4k watchingtime and full monitize 880 rupees 💥✅ 
-
-            ✅ WhatsApp link click 👇👇
-            https://wa.me/919064690454?text=Hello%20%22Sir_%20%F0%9F%91%8B%22 
-
-            💥𝐘𝐨𝐮𝐓𝐮𝐛𝐞 𝐦𝐨𝐧𝐢𝐭𝐢𝐳𝐞💥 
-
-            💥✅10k subcribes and 4k watchingtime and full monitize 880 rupees 💥✅ 
-
-            100% real subcribes permanent ✅ 
-
-            200 subcribes demo 40 rs with 100 like ✅💥 
-
-            Fraud k chakkar main mat jao  
-
-            ✅ WhatsApp link click 👇👇 
-
-            https://wa.me/919064690454?text=Hello%20%22Sir_%20%F0%9F%91%8B%22""", "promotional")
+                (
+                    "💥𝐘𝐨𝐮𝐓𝐮𝐛𝐞 𝐦𝐨𝐧𝐢𝐭𝐢𝐳𝐞💥\n\n"
+                    "1k subcribes:- 320 rs\n\n"
+                    "1k intragam followers:- 230 rs\n\n"
+                    "💥✅10k subcribes and 4k watchingtime and full monitize 880 rupees 💥✅\n\n"
+                    "✅ WhatsApp link click 👇👇\n"
+                    "https://wa.me/919064690454?text=Hello%20Sir\n\n"
+                    "100% real subcribes permanent ✅\n\n"
+                    "200 subcribes demo 40 rs with 100 like ✅💥\n\n"
+                    "✅ WhatsApp link click 👇👇\n"
+                    "https://wa.me/919064690454?text=Hello%20Sir",
+                    "promotional"
+                )
             ]
             await db.executemany("INSERT INTO messages (content, category) VALUES (?, ?)", sample_messages)
 
