@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 import logging
 from typing import Optional, Dict, Any, List
@@ -12,6 +13,12 @@ logger = logging.getLogger("QueueManager")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# Maximum groups a single listener account should handle
+MAX_GROUPS_PER_LISTENER = 35
+# Heartbeat timeout — worker considered dead if no heartbeat for this many seconds
+WORKER_HEARTBEAT_TIMEOUT = 60
+
+
 class QueueManager:
     def __init__(self):
         self.redis_client: Optional[aioredis.Redis] = None
@@ -19,10 +26,13 @@ class QueueManager:
         self._memory_queue: asyncio.Queue = asyncio.Queue()
         self._memory_seen: set = set()
         self._memory_state: dict = {
-            "active_server": 1,
+            "active_consumer": "worker-1",
             "targets": [],
             "messages": [],
-            "logs_queue": []
+            "logs_queue": [],
+            "workers": {},
+            "listener_assignments": {},
+            "replier_assignments": {},
         }
 
     async def connect(self):
@@ -46,6 +56,8 @@ class QueueManager:
             self.redis_client = None
             self.use_redis = False
 
+    # ─── Deduplication ─────────────────────────────────────────────
+
     async def is_duplicate_and_mark(self, chat_id: int, msg_id: int, ttl_seconds: int = 86400) -> bool:
         """
         Atomically checks if (chat_id, msg_id) has been seen.
@@ -64,6 +76,8 @@ class QueueManager:
             return True
         self._memory_seen.add(mem_key)
         return False
+
+    # ─── Message Queue ─────────────────────────────────────────────
 
     async def enqueue_message(self, chat_id: int, msg_id: int, text: str, sender_id: int, sender_name: str) -> bool:
         payload = {
@@ -124,25 +138,7 @@ class QueueManager:
         await self._memory_queue.put(payload)
         return True
 
-    # --- State Sync Methods for Zero-SQLite Workers ---
-
-    async def set_active_server(self, group_id: int):
-        if self.use_redis and self.redis_client:
-            try:
-                await self.redis_client.set("active_server", str(group_id))
-            except Exception as e:
-                logger.error(f"Redis set_active_server error: {e}")
-        self._memory_state["active_server"] = group_id
-
-    async def get_active_server(self) -> int:
-        if self.use_redis and self.redis_client:
-            try:
-                val = await self.redis_client.get("active_server")
-                if val:
-                    return int(val)
-            except Exception as e:
-                logger.error(f"Redis get_active_server error: {e}")
-        return self._memory_state.get("active_server", 1)
+    # ─── State Sync (Targets, Messages) ────────────────────────────
 
     async def set_active_targets(self, targets: List[str]):
         json_str = json.dumps(targets)
@@ -181,6 +177,185 @@ class QueueManager:
             except Exception as e:
                 logger.error(f"Redis get_active_messages error: {e}")
         return self._memory_state.get("messages", [])
+
+    # ─── Worker Registry & Heartbeat ────────────────────────────────
+
+    async def register_worker(self, worker_id: str):
+        """Register a worker with its heartbeat timestamp."""
+        payload = json.dumps({"heartbeat": time.time(), "status": "active"})
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.hset("workers", worker_id, payload)
+                logger.info(f"📋 Registered worker '{worker_id}' in Redis")
+            except Exception as e:
+                logger.error(f"Redis register_worker error: {e}")
+        self._memory_state["workers"][worker_id] = {"heartbeat": time.time(), "status": "active"}
+
+    async def send_heartbeat(self, worker_id: str):
+        """Update heartbeat timestamp for a worker."""
+        payload = json.dumps({"heartbeat": time.time(), "status": "active"})
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.hset("workers", worker_id, payload)
+            except Exception as e:
+                logger.error(f"Redis send_heartbeat error: {e}")
+        self._memory_state["workers"][worker_id] = {"heartbeat": time.time(), "status": "active"}
+
+    async def unregister_worker(self, worker_id: str):
+        """Remove a worker from the registry."""
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.hdel("workers", worker_id)
+            except Exception as e:
+                logger.error(f"Redis unregister_worker error: {e}")
+        self._memory_state["workers"].pop(worker_id, None)
+
+    async def get_registered_workers(self) -> Dict[str, Any]:
+        """Get all registered workers with their heartbeat info."""
+        if self.use_redis and self.redis_client:
+            try:
+                raw = await self.redis_client.hgetall("workers")
+                result = {}
+                for wid, data in raw.items():
+                    try:
+                        result[wid] = json.loads(data)
+                    except Exception:
+                        result[wid] = {"heartbeat": 0, "status": "unknown"}
+                return result
+            except Exception as e:
+                logger.error(f"Redis get_registered_workers error: {e}")
+        return dict(self._memory_state.get("workers", {}))
+
+    async def get_alive_worker_ids(self) -> List[str]:
+        """Get sorted list of worker IDs whose heartbeat is within the timeout threshold."""
+        workers = await self.get_registered_workers()
+        now = time.time()
+        alive = []
+        for wid, info in workers.items():
+            hb = info.get("heartbeat", 0)
+            if now - hb < WORKER_HEARTBEAT_TIMEOUT:
+                alive.append(wid)
+        return sorted(alive)
+
+    # ─── Active Consumer (Replier Rotation) ─────────────────────────
+
+    async def set_active_consumer(self, worker_id: str):
+        """Set which worker is the current active consumer (replier)."""
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.set("active_consumer", worker_id)
+            except Exception as e:
+                logger.error(f"Redis set_active_consumer error: {e}")
+        self._memory_state["active_consumer"] = worker_id
+
+    async def get_active_consumer(self) -> str:
+        """Get which worker is the current active consumer."""
+        if self.use_redis and self.redis_client:
+            try:
+                val = await self.redis_client.get("active_consumer")
+                if val:
+                    return val
+            except Exception as e:
+                logger.error(f"Redis get_active_consumer error: {e}")
+        return self._memory_state.get("active_consumer", "worker-1")
+
+    # Backward-compatible aliases (used by rotator)
+    async def set_active_server(self, group_id: int):
+        await self.set_active_consumer(f"worker-{group_id}")
+
+    async def get_active_server(self) -> int:
+        consumer = await self.get_active_consumer()
+        try:
+            return int(consumer.replace("worker-", ""))
+        except (ValueError, AttributeError):
+            return 1
+
+    # ─── Listener Assignments ──────────────────────────────────────
+
+    async def set_listener_assignments(self, assignments: Dict[str, List[str]]):
+        """
+        Store listener assignments: { session_name: [group1, group2, ...] }
+        """
+        json_str = json.dumps(assignments)
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.set("listener_assignments", json_str)
+                logger.info(f"📋 Stored listener assignments for {len(assignments)} accounts")
+            except Exception as e:
+                logger.error(f"Redis set_listener_assignments error: {e}")
+        self._memory_state["listener_assignments"] = assignments
+
+    async def get_listener_assignments(self) -> Dict[str, List[str]]:
+        """
+        Get listener assignments: { session_name: [group1, group2, ...] }
+        """
+        if self.use_redis and self.redis_client:
+            try:
+                val = await self.redis_client.get("listener_assignments")
+                if val:
+                    return json.loads(val)
+            except Exception as e:
+                logger.error(f"Redis get_listener_assignments error: {e}")
+        return self._memory_state.get("listener_assignments", {})
+
+    # ─── Replier Assignments (per worker) ──────────────────────────
+
+    async def set_replier_assignments(self, worker_id: str, assignments: Dict[str, List[str]]):
+        """
+        Store replier assignments for a specific worker:
+        { session_name: [group_target1, group_target2, ...] }
+        """
+        json_str = json.dumps(assignments)
+        redis_key = f"replier_assignments:{worker_id}"
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.set(redis_key, json_str)
+                logger.info(f"📋 Stored replier assignments for worker '{worker_id}': {len(assignments)} accounts")
+            except Exception as e:
+                logger.error(f"Redis set_replier_assignments error: {e}")
+        self._memory_state["replier_assignments"][worker_id] = assignments
+
+    async def get_replier_assignments(self, worker_id: str) -> Dict[str, List[str]]:
+        """
+        Get replier assignments for a specific worker:
+        { session_name: [group_target1, group_target2, ...] }
+        """
+        redis_key = f"replier_assignments:{worker_id}"
+        if self.use_redis and self.redis_client:
+            try:
+                val = await self.redis_client.get(redis_key)
+                if val:
+                    return json.loads(val)
+            except Exception as e:
+                logger.error(f"Redis get_replier_assignments error: {e}")
+        worker_assignments = self._memory_state.get("replier_assignments", {})
+        return worker_assignments.get(worker_id, {})
+
+    async def get_all_replier_assignments(self) -> Dict[str, Dict[str, List[str]]]:
+        """
+        Get replier assignments for ALL workers.
+        Returns: { worker_id: { session_name: [groups] } }
+        """
+        result = {}
+        if self.use_redis and self.redis_client:
+            try:
+                # Scan for all replier_assignments:* keys
+                cursor = 0
+                while True:
+                    cursor, keys = await self.redis_client.scan(cursor, match="replier_assignments:*", count=100)
+                    for key in keys:
+                        wid = key.replace("replier_assignments:", "")
+                        val = await self.redis_client.get(key)
+                        if val:
+                            result[wid] = json.loads(val)
+                    if cursor == 0:
+                        break
+                return result
+            except Exception as e:
+                logger.error(f"Redis get_all_replier_assignments error: {e}")
+        return dict(self._memory_state.get("replier_assignments", {}))
+
+    # ─── Worker Logs ───────────────────────────────────────────────
 
     async def push_worker_log(self, action: str, level: str, details: str, phone: str = None, server_group: int = None, target: str = None):
         payload = {

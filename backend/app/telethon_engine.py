@@ -165,7 +165,7 @@ class TelethonEngine:
         session_path = os.path.join(SESSIONS_DIR, f"{session_name}.session")
         has_real_session = os.path.exists(session_path)
 
-        ref_num = random.randint(100000, 999999)
+        ref_num = message_id
         full_message = f"{message_text}\n\nref_{ref_num}#"
         typing_duration = random.randint(3, 7)
 

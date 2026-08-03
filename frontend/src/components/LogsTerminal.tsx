@@ -15,6 +15,12 @@ export default function LogsTerminal({ logs }: LogsTerminalProps) {
     }
   }, [logs]);
 
+  const getWorkerColor = (group?: number) => {
+    const colors = ['#38bdf8', '#c084fc', '#34d399', '#fbbf24', '#f87171'];
+    if (!group || group < 1) return '#94a3b8';
+    return colors[(group - 1) % colors.length];
+  };
+
   return (
     <div className="card">
       <div className="card-title" style={{ justifyContent: 'space-between' }}>
@@ -30,8 +36,8 @@ export default function LogsTerminal({ logs }: LogsTerminalProps) {
           logs.map((log) => (
             <div key={log.id} className="terminal-line">
               <span className="log-time">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
-              <span style={{ color: log.server_group === 1 ? '#38bdf8' : '#c084fc', fontWeight: '600' }}>
-                [S{log.server_group || '?'}]
+              <span style={{ color: getWorkerColor(log.server_group), fontWeight: '600' }}>
+                [W{log.server_group || '?'}]
               </span>
               <span className={`log-${log.status}`}>[{log.action}]</span>
               <span style={{ color: 'white' }}>{log.account_phone ? `${log.account_phone}:` : ''}</span>

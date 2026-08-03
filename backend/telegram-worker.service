@@ -1,0 +1,29 @@
+[Unit]
+Description=Telegram Production Worker Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=telegram
+Group=telegram
+
+WorkingDirectory=/home/telegram/Telegram-Client/backend
+
+EnvironmentFile=/home/telegram/Telegram-Client/backend/.env
+Environment="WORKER_ID=worker-1"
+
+ExecStart=/home/telegram/Telegram-Client/backend/venv/bin/python worker.py
+
+Restart=always
+RestartSec=5
+
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

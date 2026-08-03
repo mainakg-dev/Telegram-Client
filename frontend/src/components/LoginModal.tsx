@@ -290,17 +290,17 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: LoginModalPro
 
             <div style={{ marginBottom: '20px' }}>
               <label style={{ display: 'block', fontSize: '0.8rem', color: '#94a3b8', marginBottom: '6px' }}>
-                Server Shift Group
+                Worker Group (auto-assigned if left as 1)
               </label>
-              <select 
+              <input 
+                type="number" 
                 className="input" 
-                value={serverGroup} 
-                onChange={(e) => setServerGroup(Number(e.target.value))}
+                placeholder="1" 
+                min={1}
+                value={serverGroup}
+                onChange={(e) => setServerGroup(Number(e.target.value) || 1)}
                 style={{ width: '100%' }}
-              >
-                <option value={1}>Server 1 Group</option>
-                <option value={2}>Server 2 Group</option>
-              </select>
+              />
             </div>
 
             <button type="submit" className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} disabled={loading}>

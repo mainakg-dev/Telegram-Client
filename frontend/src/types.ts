@@ -3,6 +3,7 @@ export interface Account {
   phone: string;
   session_name: string;
   server_group: number;
+  role: 'LISTENER' | 'REPLIER';
   status: 'ACTIVE' | 'TYPING' | 'RESTING' | 'FLOOD_WAIT' | 'ERROR' | 'UNAUTHORIZED' | 'DISABLED';
   api_id?: number;
   api_hash?: string;
@@ -35,8 +36,16 @@ export interface Log {
   details?: string;
 }
 
+export interface WorkerInfo {
+  worker_id: string;
+  heartbeat: number;
+  status: 'alive' | 'dead' | 'unknown';
+  seconds_since_heartbeat?: number;
+}
+
 export interface AppState {
   active_server: number;
+  active_consumer?: string;
   is_running: boolean;
   rotation_interval_minutes: number;
   elapsed_seconds: number;
@@ -46,4 +55,7 @@ export interface AppState {
   messages: Message[];
   targets: Target[];
   logs: Log[];
+  workers?: Record<string, { heartbeat: number; status: string }>;
+  alive_workers?: string[];
+  listener_assignments?: Record<string, string[]>;
 }

@@ -1,6 +1,16 @@
+"""
+Production Worker Node — Listener/Replier Split Architecture
+
+Key design:
+- LISTENER accounts: Small subset (~3) that each monitor ~35 groups for new messages
+- REPLIER accounts: Remaining accounts (~67) used for round-robin reply dispatch
+- Only 1 account listens to each group at any time (minimum listener connections)
+- All workers listen ALWAYS; only the consumer (replier) role rotates every 10 minutes
+- Worker ID configured via WORKER_ID env var (replaces worker2.py)
+"""
+
 import os
 from datetime import datetime, timezone
-import sys
 import time
 import random
 import asyncio
@@ -12,16 +22,30 @@ load_dotenv()
 
 from app.queue_manager import queue_manager
 from app.telethon_engine import engine_instance, SESSIONS_DIR
+from app.listener_assigner import (
+    auto_assign_listeners, auto_assign_repliers,
+    handle_listener_failure, build_target_to_replier_map
+)
 from telethon import events, functions, errors
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] (Worker-Microservice): %(message)s"
+    format="%(asctime)s [%(levelname)s] (Worker-%(message)s"
 )
-logger = logging.getLogger("StandaloneWorker")
+# Re-configure the format properly
+for handler in logging.root.handlers:
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] (Worker): %(message)s"))
 
-# Determine which server group this worker node belongs to (1 or 2)
-SERVER_GROUP = int(os.getenv("SERVER_GROUP", "1"))
+logger = logging.getLogger("ProductionWorker")
+
+# Worker identity — unique per server
+WORKER_ID = os.getenv("WORKER_ID", "worker-1")
+
+# Heartbeat interval in seconds
+HEARTBEAT_INTERVAL = 15
+
+# Max concurrent reply tasks (configurable via env var)
+MAX_CONCURRENT_REPLIES = int(os.getenv("MAX_CONCURRENT_REPLIES", "1"))
 
 
 async def resolve_and_join_target(client, target_str: str):
@@ -124,66 +148,177 @@ async def resolve_and_join_target(client, target_str: str):
     return entity
 
 
-class DedicatedWorkerNode:
-    def __init__(self, group_id: int):
-        self.group_id = group_id
-        self.is_running = False
-        self.active_listeners: dict = {}  # acc_id -> set of target strings
-        self.active_handlers: dict = {}   # acc_id -> handler function
-        self.resolved_targets: dict = {} # acc_id -> {target_str: entity}
-        self.rr_index: int = 0
-        self.self_ids: set = set()  # cached Telegram user IDs for self-loop detection
-        self._last_listener_refresh: float = 0
+def is_reply_message(message) -> bool:
+    """
+    Returns True ONLY if the message is a reply to another specific message or comment.
+    - In normal groups: reply_to_msg_id is present.
+    - In channel discussion threads / topics: reply_to_top_id is present.
+      If reply_to_msg_id != reply_to_top_id, it is a reply to a specific comment inside the thread.
+      If reply_to_msg_id == reply_to_top_id, it is a top-level comment on the main channel post (NOT a reply to a comment).
+    """
+    reply_to = getattr(message, 'reply_to', None)
+    if reply_to is None:
+        return False
 
-    def load_local_accounts(self) -> list:
+    top_id = getattr(reply_to, 'reply_to_top_id', None)
+    msg_id = getattr(reply_to, 'reply_to_msg_id', None)
+
+    if top_id is not None:
+        return msg_id is not None and msg_id != top_id
+
+    return msg_id is not None
+
+
+class ProductionWorkerNode:
+    """
+    Production worker that splits accounts into two roles:
+    - LISTENERS: Small subset of accounts (~3) each monitoring ~35 groups
+    - REPLIERS: Remaining accounts (~67) for round-robin reply dispatch
+    
+    All workers listen ALWAYS. Only the consumer/replier role rotates.
+    """
+
+    def __init__(self, worker_id: str):
+        self.worker_id = worker_id
+        self.is_running = False
+
+        # Listener tracking
+        self.listener_handlers: dict = {}    # session_name -> handler function
+        self.listener_targets: dict = {}     # session_name -> set of target strings currently listened
+        self.resolved_targets: dict = {}     # session_name -> {target_str: entity}
+
+        # Replier assignment tracking
+        self.chat_id_to_target: dict = {}    # chat_id (int) -> target_string
+        self.target_to_replier: dict = {}    # target_string -> replier session_name
+        self.replier_accounts_cache: dict = {}  # session_name -> account dict
+
+        # Self-loop detection
+        self.self_ids: set = set()
+
+        # Concurrency controls
+        self._reply_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REPLIES)
+        self._group_locks: dict = {}   # chat_id -> asyncio.Lock (per-group)
+        self._active_reply_tasks: set = set()  # track in-flight tasks
+
+        # Timing
+        self._last_listener_refresh: float = 0
+        self._last_heartbeat: float = 0
+
+    # ─── Account Loading ────────────────────────────────────────
+
+    def load_accounts_by_role(self, role: str) -> list:
+        """
+        Load accounts from local session files, filtered by role (LISTENER or REPLIER).
+        Also loads accounts whose server_group matches this worker's group (for multi-server).
+        """
         accounts = []
         if not os.path.exists(SESSIONS_DIR):
             return accounts
 
+        db_path = os.path.join(os.path.dirname(__file__), "data", "app.db")
+        db_accounts = {}
+        if os.path.exists(db_path):
+            try:
+                import sqlite3
+                conn = sqlite3.connect(db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, phone, session_name, server_group, role, status "
+                    "FROM accounts ORDER BY id ASC"
+                )
+                for row in cursor.fetchall():
+                    db_accounts[row["session_name"]] = dict(row)
+                conn.close()
+            except Exception:
+                pass
+
         session_files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".session")]
-        for idx, sfile in enumerate(sorted(session_files), start=1):
+        for sfile in sorted(session_files):
             session_name = sfile.replace(".session", "")
+
+            if session_name not in db_accounts:
+                continue
+
+            acc_info = db_accounts[session_name]
+
+            # Filter by role
+            if acc_info.get("role", "REPLIER") != role:
+                continue
+
+            # Skip disabled/unauthorized
+            if acc_info.get("status") in ("UNAUTHORIZED", "DISABLED"):
+                continue
+
             phone = "+" + session_name.replace("acc_", "") if "acc_" in session_name else session_name
             accounts.append({
-                "id": idx,
+                "id": acc_info["id"],
                 "phone": phone,
                 "session_name": session_name,
-                "server_group": self.group_id,
-                "status": "ACTIVE"
+                "server_group": acc_info.get("server_group", 1),
+                "role": role,
+                "status": acc_info.get("status", "ACTIVE")
             })
         return accounts
 
+    def load_all_local_accounts(self) -> list:
+        """Load all accounts (both listeners and repliers) from local sessions."""
+        listeners = self.load_accounts_by_role("LISTENER")
+        repliers = self.load_accounts_by_role("REPLIER")
+        return listeners + repliers
+
     def _get_next_rr_account(self, active_accounts: list) -> dict:
+        """Fallback round-robin if no replier assignment found."""
         if not active_accounts:
             return None
-        selected = active_accounts[self.rr_index % len(active_accounts)]
-        self.rr_index = (self.rr_index + 1) % len(active_accounts)
+        selected = active_accounts[0]
         return selected
+
+    # ─── Listener Setup (Key Innovation) ─────────────────────────
 
     async def setup_listeners(self):
         """
-        Attaches/updates real-time event listeners for target channels fetched from Redis.
-        Dynamically refreshes listeners whenever new target groups are added.
+        Sets up event handlers for LISTENER accounts ONLY.
+        Each listener monitors only its assigned subset of groups (from Redis assignments).
+        This is the key difference from the old architecture where ALL accounts listened to ALL groups.
         """
-        group_accounts = self.load_local_accounts()
-        targets = await queue_manager.get_active_targets()
+        # Get assignments from Redis
+        assignments = await queue_manager.get_listener_assignments()
 
-        if not group_accounts or not targets:
-            logger.debug(f"No active accounts or targets in Redis for Server Group {self.group_id}.")
+        if not assignments:
+            # No assignments yet — trigger auto-assignment
+            logger.info("No listener assignments found — triggering auto-assignment...")
+            assignments = await auto_assign_listeners()
+            if not assignments:
+                logger.warning("No listener assignments could be created (no targets or accounts)")
+                return
+
+        # Load listener accounts from local session files
+        listener_accounts = self.load_accounts_by_role("LISTENER")
+        if not listener_accounts:
+            logger.warning("No LISTENER accounts found on this worker node")
             return
 
-        current_target_set = set(targets)
+        # Map session_name -> account dict for quick lookup
+        acc_by_session = {acc["session_name"]: acc for acc in listener_accounts}
 
-        for acc in group_accounts:
-            acc_id = acc["id"]
-            
-            # Check if this account is already listening to the EXACT same set of targets
-            if self.active_listeners.get(acc_id) == current_target_set:
+        for session_name, assigned_groups in assignments.items():
+            # Only process listeners that exist on THIS worker node
+            if session_name not in acc_by_session:
+                continue
+
+            acc = acc_by_session[session_name]
+            current_group_set = set(assigned_groups)
+
+            # Skip if already listening to the exact same set
+            if self.listener_targets.get(session_name) == current_group_set:
                 continue
 
             try:
                 client = await engine_instance.get_client_for_account(acc)
                 if not client or not await client.is_user_authorized():
+                    logger.warning(f"Listener '{session_name}' client not available — triggering failover")
+                    await handle_listener_failure(session_name)
                     continue
 
                 # Cache this account's Telegram user ID for self-loop detection
@@ -194,43 +329,64 @@ class DedicatedWorkerNode:
                 except Exception:
                     pass
 
-                if acc_id not in self.resolved_targets:
-                    self.resolved_targets[acc_id] = {}
+                # Initialize resolved targets cache for this account
+                if session_name not in self.resolved_targets:
+                    self.resolved_targets[session_name] = {}
 
+                # Resolve ONLY the assigned groups for this listener
                 resolved_chats = []
-                for t in targets:
-                    if t in self.resolved_targets[acc_id]:
-                        resolved_chats.append(self.resolved_targets[acc_id][t])
+                for t in assigned_groups:
+                    if t in self.resolved_targets[session_name]:
+                        resolved_chats.append(self.resolved_targets[session_name][t])
                         continue
 
                     entity = await resolve_and_join_target(client, t)
                     if entity:
                         resolved_chats.append(entity)
-                        self.resolved_targets[acc_id][t] = entity
-                        logger.info(f"🎯 Resolved & Joined target '{t}' for account #{acc_id} ({acc['phone']})")
+                        self.resolved_targets[session_name][t] = entity
+                        # Build reverse map: chat_id -> target_string
+                        entity_id = getattr(entity, 'id', None)
+                        if entity_id:
+                            self.chat_id_to_target[entity_id] = t
+                            # Also store with negative prefix for supergroups/channels
+                            self.chat_id_to_target[-1000000000000 - entity_id] = t
+                            self.chat_id_to_target[int(f"-100{entity_id}")] = t
+                        logger.info(f"🎯 Listener '{session_name}' resolved target '{t}' (chat_id: {entity_id})")
 
                 if not resolved_chats:
-                    logger.warning(f"No targets resolved for account #{acc_id} ({acc['phone']})")
+                    logger.warning(f"No targets resolved for listener '{session_name}'")
                     continue
 
                 # Remove old handler if updating target list
-                if acc_id in self.active_handlers:
+                if session_name in self.listener_handlers:
                     try:
-                        client.remove_event_handler(self.active_handlers[acc_id])
+                        client.remove_event_handler(self.listener_handlers[session_name])
                     except Exception:
                         pass
 
-                def create_handler():
+                # Create new event handler
+                def create_handler(listener_session):
                     handler_start_time = datetime.now(timezone.utc)
 
                     async def new_message_handler(event):
                         try:
-                            # Fix 1: Skip replayed/catch-up messages from before handler was attached
+                            # Skip replayed/catch-up messages from before handler was attached
                             if event.message.date and event.message.date < handler_start_time:
                                 return
 
+                            # Skip messages that are replies to another message / comment
+                            # TEMPORARILY DISABLED
+                            # if is_reply_message(event.message):
+                            #     reply_target_id = getattr(event.message.reply_to, 'reply_to_msg_id', None)
+                            #     logger.info(f"⏭️ Skipping msg #{event.message.id} in chat {event.chat_id} (it is a reply to msg #{reply_target_id})")
+                            #     return
+
                             msg_text = event.message.message or getattr(event.message, 'text', '')
                             if not msg_text:
+                                return
+
+                            # Skip messages from our own bot (they contain ref_XXX# signature)
+                            if 'ref_' in msg_text and msg_text.rstrip().endswith('#'):
                                 return
 
                             # Avoid self loops (uses cached IDs)
@@ -242,7 +398,7 @@ class DedicatedWorkerNode:
                             if is_dup:
                                 return
 
-                            # Fix 2: Enqueue IMMEDIATELY after dedup — no yielding awaits in between
+                            # Enqueue IMMEDIATELY after dedup
                             sender_name = str(event.sender_id or 'Unknown')
 
                             await queue_manager.enqueue_message(
@@ -260,104 +416,350 @@ class DedicatedWorkerNode:
                             except Exception:
                                 pass
 
-                            logger.info(f"⚡ [WORKER-{self.group_id}] Detected & Enqueued msg #{event.message.id} in chat {event.chat_id} from {sender_name}")
+                            logger.info(
+                                f"⚡ [{self.worker_id}][Listener:{listener_session}] "
+                                f"Detected & Enqueued msg #{event.message.id} in chat {event.chat_id} from {sender_name}"
+                            )
 
                         except Exception as ex:
-                            logger.error(f"Error handling event: {ex}")
+                            logger.error(f"Error in listener handler: {ex}")
                     return new_message_handler
 
-                new_handler = create_handler()
+                new_handler = create_handler(session_name)
                 client.add_event_handler(new_handler, events.NewMessage(chats=resolved_chats))
-                
-                self.active_handlers[acc_id] = new_handler
-                self.active_listeners[acc_id] = current_target_set
-                logger.info(f"✅ Telethon listener active ({len(resolved_chats)} targets) for account #{acc_id} ({acc['phone']})")
 
-            except (errors.AuthKeyUnregisteredError, errors.UserDeactivatedError, errors.UserDeactivatedBanError, errors.SessionRevokedError) as e:
-                logger.error(f"Session error for account #{acc_id} ({acc.get('phone')}): {e}")
-                self.active_listeners.pop(acc_id, None)
-                self.active_handlers.pop(acc_id, None)
-                await engine_instance.handle_invalid_session(acc_id, session_name=acc.get("session_name"))
+                self.listener_handlers[session_name] = new_handler
+                self.listener_targets[session_name] = current_group_set
+                logger.info(
+                    f"✅ Listener '{session_name}' active with {len(resolved_chats)} groups "
+                    f"(out of {len(assigned_groups)} assigned)"
+                )
+
+            except (errors.AuthKeyUnregisteredError, errors.UserDeactivatedError,
+                    errors.UserDeactivatedBanError, errors.SessionRevokedError) as e:
+                logger.error(f"Session error for listener '{session_name}': {e}")
+                self.listener_handlers.pop(session_name, None)
+                self.listener_targets.pop(session_name, None)
+                await engine_instance.handle_invalid_session(
+                    acc["id"], session_name=session_name
+                )
+                # Trigger failover — reassign this listener's groups
+                await handle_listener_failure(session_name)
+
             except Exception as e:
-                logger.error(f"Error setting up listener for account #{acc_id}: {e}")
+                logger.error(f"Error setting up listener '{session_name}': {e}")
+
+        # Also cache self_ids for replier accounts (for self-loop detection in listeners)
+        replier_accounts = self.load_accounts_by_role("REPLIER")
+        for acc in replier_accounts:
+            self.replier_accounts_cache[acc["session_name"]] = acc
+            try:
+                client = await engine_instance.get_client_for_account(acc)
+                if client:
+                    me = await client.get_me()
+                    if me:
+                        self.self_ids.add(me.id)
+            except Exception:
+                pass
+
+        # Load replier assignments and build lookup map
+        await self._refresh_replier_assignments()
+
+        # Pre-resolve target groups for each replier account so Telethon entity cache is warm
+        await self._resolve_replier_targets()
+
+    async def _refresh_replier_assignments(self):
+        """Load replier assignments from Redis and build the target→replier lookup map."""
+        assignments = await queue_manager.get_replier_assignments(self.worker_id)
+        if assignments:
+            self.target_to_replier = build_target_to_replier_map(assignments)
+            logger.info(f"📋 Loaded replier assignments: {len(self.target_to_replier)} group→replier mappings")
+        else:
+            self.target_to_replier = {}
+
+    async def _resolve_replier_targets(self):
+        """
+        For each replier account, resolve and join all its assigned target groups.
+        This warms Telethon's entity cache so reply_to_channel_message can find the PeerChannel.
+        """
+        assignments = await queue_manager.get_replier_assignments(self.worker_id)
+        if not assignments:
+            return
+
+        for session_name, assigned_groups in assignments.items():
+            acc = self.replier_accounts_cache.get(session_name)
+            if not acc:
+                continue
+
+            try:
+                client = await engine_instance.get_client_for_account(acc)
+                if not client or not await client.is_user_authorized():
+                    continue
+
+                for target_str in assigned_groups:
+                    try:
+                        entity = await resolve_and_join_target(client, target_str)
+                        if entity:
+                            entity_id = getattr(entity, 'id', None)
+                            logger.info(
+                                f"🔗 Replier '{session_name}' resolved target '{target_str}' "
+                                f"(chat_id: {entity_id})"
+                            )
+                    except Exception as ex:
+                        logger.warning(f"Replier '{session_name}' failed to resolve '{target_str}': {ex}")
+
+            except Exception as e:
+                logger.error(f"Error resolving targets for replier '{session_name}': {e}")
+
+
+    def _find_replier_for_chat(self, chat_id: int) -> dict:
+        """
+        Find the assigned replier account for a specific chat_id.
+        Uses chat_id → target_string → replier_session_name → account dict.
+        Returns None if no assignment found.
+        """
+        # Look up target_string from chat_id
+        target_str = self.chat_id_to_target.get(chat_id)
+        if not target_str:
+            # Try as-is (might be stored differently)
+            target_str = self.chat_id_to_target.get(str(chat_id))
+
+        if not target_str:
+            logger.debug(f"No target_string mapping for chat_id {chat_id}")
+            return None
+
+        # Look up replier session for this target
+        replier_session = self.target_to_replier.get(target_str)
+        if not replier_session:
+            logger.debug(f"No replier assigned for target '{target_str}'")
+            return None
+
+        # Look up account dict
+        acc = self.replier_accounts_cache.get(replier_session)
+        if not acc:
+            logger.debug(f"Replier '{replier_session}' not in local cache")
+            return None
+
+        return acc
+
+    async def _ensure_replier_resolved(self, account: dict, chat_id: int):
+        """
+        Ensure the replier account's Telethon client has resolved the target entity.
+        Looks up the target_string from chat_id and calls resolve_and_join_target
+        if the replier hasn't resolved it yet. This is a safety net for cases where
+        the startup pre-resolve didn't cover this group.
+        """
+        target_str = self.chat_id_to_target.get(chat_id)
+        if not target_str:
+            return
+
+        session_name = account.get("session_name")
+        # Track which repliers have already resolved which targets
+        cache_key = f"{session_name}:{target_str}"
+        if not hasattr(self, '_replier_resolved_cache'):
+            self._replier_resolved_cache = set()
+
+        if cache_key in self._replier_resolved_cache:
+            return  # Already resolved
+
+        try:
+            client = await engine_instance.get_client_for_account(account)
+            if client and await client.is_user_authorized():
+                entity = await resolve_and_join_target(client, target_str)
+                if entity:
+                    self._replier_resolved_cache.add(cache_key)
+                    logger.info(
+                        f"🔗 On-demand: Replier '{session_name}' resolved '{target_str}' "
+                        f"(chat_id: {getattr(entity, 'id', None)})"
+                    )
+        except Exception as ex:
+            logger.warning(f"On-demand resolve failed for replier '{session_name}' -> '{target_str}': {ex}")
+
+    # ─── Consumer Loop (Replier Dispatch) ─────────────────────────
+
+    def _get_group_lock(self, chat_id: int) -> asyncio.Lock:
+        """Get or create a per-group lock so only one reply targets a group at a time."""
+        if chat_id not in self._group_locks:
+            self._group_locks[chat_id] = asyncio.Lock()
+        return self._group_locks[chat_id]
+
+    async def _dispatch_reply(self, job: dict, msg_to_send: str):
+        """
+        Handles a single reply job. Acquires the per-group lock first, then the
+        global semaphore, so at most MAX_CONCURRENT_REPLIES are in-flight and
+        no two replies target the same group simultaneously.
+        """
+        chat_id = job.get("chat_id")
+        msg_id = job.get("msg_id")
+        group_lock = self._get_group_lock(chat_id)
+
+        async with group_lock:            # per-group: 1 reply at a time
+            async with self._reply_semaphore:  # global cap
+                # Step 1: Try to find the ASSIGNED replier for this group
+                assigned_replier = self._find_replier_for_chat(chat_id)
+
+                if assigned_replier:
+                    # Ensure the replier has resolved this chat entity before sending
+                    await self._ensure_replier_resolved(assigned_replier, chat_id)
+
+                    success = await engine_instance.reply_to_channel_message(
+                        assigned_replier, chat_id, msg_id, msg_to_send
+                    )
+                    if success:
+                        logger.info(
+                            f"✅ [{self.worker_id}] Replied to msg #{msg_id} in chat {chat_id} "
+                            f"via assigned replier {assigned_replier['phone']}"
+                        )
+                        await queue_manager.push_worker_log(
+                            "AUTO_REPLY", "SUCCESS",
+                            f"Replied to msg #{msg_id} in chat {chat_id} (assigned replier)",
+                            assigned_replier["phone"], assigned_replier.get("server_group"), str(chat_id)
+                        )
+                    else:
+                        logger.warning(
+                            f"Assigned replier {assigned_replier['phone']} failed for chat {chat_id}. Re-queueing."
+                        )
+                        await queue_manager.requeue_for_retry(job)
+                else:
+                    # Fallback: no assignment found — use any available replier
+                    replier_accounts = self.load_accounts_by_role("REPLIER")
+                    if not replier_accounts:
+                        logger.warning(f"[{self.worker_id}] No replier accounts available. Re-queueing job.")
+                        await queue_manager.requeue_for_retry(job)
+                        return
+
+                    fallback_acc = self._get_next_rr_account(replier_accounts)
+                    if not fallback_acc:
+                        await queue_manager.requeue_for_retry(job)
+                        return
+
+                    success = await engine_instance.reply_to_channel_message(
+                        fallback_acc, chat_id, msg_id, msg_to_send
+                    )
+                    if success:
+                        logger.info(
+                            f"✅ [{self.worker_id}] Replied to msg #{msg_id} in chat {chat_id} "
+                            f"via FALLBACK replier {fallback_acc['phone']}"
+                        )
+                        await queue_manager.push_worker_log(
+                            "AUTO_REPLY", "SUCCESS",
+                            f"Replied to msg #{msg_id} in chat {chat_id} (fallback replier)",
+                            fallback_acc["phone"], fallback_acc.get("server_group"), str(chat_id)
+                        )
+                    else:
+                        await queue_manager.requeue_for_retry(job)
 
     async def consumer_loop(self):
         """
-        Pops queued jobs from Redis and dispatches replies using local accounts.
-        Zero SQLite queries required.
+        Pops queued jobs from Redis and dispatches replies using ASSIGNED replier accounts.
+        Each group has exactly 1 assigned replier on this worker.
+        Only processes when this worker is the active consumer.
+
+        Dispatches up to MAX_CONCURRENT_REPLIES tasks concurrently, with per-group
+        locking so no two replies go to the same group at the same time.
         """
-        logger.info(f"⚙️ Worker Group {self.group_id} consumer loop starting...")
+        logger.info(
+            f"⚙️ [{self.worker_id}] Consumer loop starting "
+            f"(max_concurrent_replies={MAX_CONCURRENT_REPLIES})..."
+        )
         while self.is_running:
-            # Check if it's this worker's shift BEFORE dequeuing
-            active_server = await queue_manager.get_active_server()
-            if active_server != self.group_id:
+            # Check if it's this worker's turn to consume
+            active_consumer = await queue_manager.get_active_consumer()
+            if active_consumer != self.worker_id:
                 await asyncio.sleep(2)
                 continue
 
             job = await queue_manager.dequeue_message(timeout=1)
             if not job:
+                # Refresh listeners and replier assignments periodically
                 now = time.time()
                 if now - self._last_listener_refresh > 30:
                     await self.setup_listeners()
+                    await self._refresh_replier_assignments()
                     self._last_listener_refresh = now
+                # Cleanup finished tasks
+                self._active_reply_tasks = {t for t in self._active_reply_tasks if not t.done()}
                 continue
 
-            chat_id = job.get("chat_id")
-            msg_id = job.get("msg_id")
-
-            active_accounts = self.load_local_accounts()
             msgs = await queue_manager.get_active_messages()
-
-            if not active_accounts or not msgs:
-                logger.warning(f"No local accounts or active messages in Redis for Group {self.group_id}. Re-queueing job.")
+            if not msgs:
+                logger.warning(f"[{self.worker_id}] No messages available. Re-queueing job.")
                 await queue_manager.requeue_for_retry(job)
                 continue
 
             msg_to_send = random.choice(msgs)
 
-            attempts = 0
-            max_attempts = len(active_accounts)
-            success = False
+            # Spawn a concurrent reply task (gated by semaphore + per-group lock)
+            task = asyncio.create_task(self._dispatch_reply(job, msg_to_send))
+            self._active_reply_tasks.add(task)
+            task.add_done_callback(self._active_reply_tasks.discard)
 
-            while attempts < max_attempts:
-                selected_acc = self._get_next_rr_account(active_accounts)
-                attempts += 1
-                if not selected_acc:
-                    break
+            # Cleanup finished tasks periodically
+            self._active_reply_tasks = {t for t in self._active_reply_tasks if not t.done()}
 
-                success = await engine_instance.reply_to_channel_message(
-                    selected_acc,
-                    chat_id,
-                    msg_id,
-                    msg_to_send
-                )
-                if success:
-                    logger.info(f"✅ [WORKER-{self.group_id}] Replied to msg #{msg_id} in chat {chat_id}")
-                    await queue_manager.push_worker_log("AUTO_REPLY", "SUCCESS", f"Replied to msg #{msg_id} in chat {chat_id}", selected_acc["phone"], self.group_id, str(chat_id))
-                    break
+    # ─── Heartbeat Loop ──────────────────────────────────────────
 
-            if not success:
-                logger.warning(f"Failed reply for msg ({chat_id}, {msg_id}). Re-queueing for retry.")
-                await queue_manager.requeue_for_retry(job)
+    async def heartbeat_loop(self):
+        """Periodically sends heartbeat to Redis so other workers know this one is alive."""
+        while self.is_running:
+            try:
+                await queue_manager.send_heartbeat(self.worker_id)
+            except Exception as e:
+                logger.error(f"Heartbeat error: {e}")
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+    # ─── Lifecycle ───────────────────────────────────────────────
 
     async def start(self):
         self.is_running = True
         await queue_manager.connect()
-        logger.info(f"🚀 Started SQLite-Free Worker Node for Server Group {self.group_id}")
-        await queue_manager.push_worker_log("WORKER_START", "INFO", f"Worker node started for Server Group {self.group_id}", server_group=self.group_id)
+
+        # Register this worker
+        await queue_manager.register_worker(self.worker_id)
+
+        logger.info(f"🚀 Started Production Worker '{self.worker_id}'")
+        await queue_manager.push_worker_log(
+            "WORKER_START", "INFO",
+            f"Production worker '{self.worker_id}' started",
+            server_group=1
+        )
+
+        # Run listener assignment (auto-pick listeners)
+        await auto_assign_listeners()
+
+        # Run replier assignment (assign groups to replier accounts)
+        await auto_assign_repliers(self.worker_id)
+
+        # Setup listeners
         await self.setup_listeners()
-        await self.consumer_loop()
+        self._last_listener_refresh = time.time()
+
+        # Run heartbeat + consumer loop concurrently
+        await asyncio.gather(
+            self.heartbeat_loop(),
+            self.consumer_loop()
+        )
 
     async def stop(self):
         self.is_running = False
+
+        # Wait for in-flight reply tasks to finish (up to 15s)
+        pending = [t for t in self._active_reply_tasks if not t.done()]
+        if pending:
+            logger.info(f"⏳ Waiting for {len(pending)} in-flight replies to finish...")
+            await asyncio.wait(pending, timeout=15)
+
+        # Unregister worker
+        await queue_manager.unregister_worker(self.worker_id)
+
         await queue_manager.disconnect()
         await engine_instance.disconnect_all()
-        logger.info(f"🛑 Stopped Worker Node for Server Group {self.group_id}")
+        logger.info(f"🛑 Stopped Production Worker '{self.worker_id}'")
 
 
 async def main():
-    worker = DedicatedWorkerNode(group_id=SERVER_GROUP)
-    
+    worker = ProductionWorkerNode(worker_id=WORKER_ID)
+
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 

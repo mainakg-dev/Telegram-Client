@@ -11,6 +11,7 @@ import { API_URI, getWsUrl } from "./config";
 export default function App() {
   const [state, setState] = useState<AppState>({
     active_server: 1,
+    active_consumer: 'worker-1',
     is_running: false,
     rotation_interval_minutes: 10,
     elapsed_seconds: 0,
@@ -20,6 +21,8 @@ export default function App() {
     messages: [],
     targets: [],
     logs: [],
+    workers: {},
+    alive_workers: [],
   });
 
   const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
@@ -126,6 +129,7 @@ export default function App() {
       <AccountGrid
         accounts={state.accounts || []}
         activeServer={state.active_server}
+        activeConsumer={state.active_consumer}
         onDeleteAccount={handleDeleteAccount}
       />
 

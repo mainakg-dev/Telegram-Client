@@ -14,7 +14,8 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT UNIQUE,
             session_name TEXT UNIQUE NOT NULL,
-            server_group INTEGER NOT NULL CHECK (server_group IN (1, 2)),
+            server_group INTEGER NOT NULL DEFAULT 1,
+            role TEXT NOT NULL DEFAULT 'REPLIER',
             status TEXT NOT NULL DEFAULT 'RESTING', -- ACTIVE, TYPING, RESTING, FLOOD_WAIT, ERROR, DISABLED
             api_id INTEGER,
             api_hash TEXT,
@@ -23,6 +24,13 @@ async def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         """)
+
+        # Migration: add role column to existing databases
+        try:
+            await db.execute("ALTER TABLE accounts ADD COLUMN role TEXT NOT NULL DEFAULT 'REPLIER'")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS messages (

@@ -14,6 +14,7 @@ from .database import init_db, get_db, set_setting, add_log, get_setting
 from .telethon_engine import engine_instance, SESSIONS_DIR
 from .rotator import rotator_instance
 from .config import DEFAULT_API_ID, DEFAULT_API_HASH
+from .listener_assigner import auto_assign_listeners, get_listener_summary
 
 
 class ConnectionManager:
@@ -389,3 +390,65 @@ async def delete_account(acc_id: int):
 
     await rotator_instance.notify_clients("account_deleted")
     return {"status": "success", "message": f"Account #{acc_id} deleted"}
+
+# ─── Account Role Management ──────────────────────────────────
+
+@app.post("/api/accounts/{acc_id}/role")
+async def set_account_role(acc_id: int, payload: Dict[str, str] = Body(...)):
+    """Set account role to LISTENER or REPLIER."""
+    role = payload.get("role", "").upper()
+    if role not in ("LISTENER", "REPLIER"):
+        raise HTTPException(status_code=400, detail="Role must be LISTENER or REPLIER")
+
+    async with get_db() as db:
+        async with db.execute("SELECT id FROM accounts WHERE id = ?", (acc_id,)) as cursor:
+            if not await cursor.fetchone():
+                raise HTTPException(status_code=404, detail=f"Account #{acc_id} not found")
+        await db.execute("UPDATE accounts SET role = ? WHERE id = ?", (role, acc_id))
+        await db.commit()
+
+    await add_log("ROLE_CHANGE", "INFO", f"Account #{acc_id} role set to {role}")
+    await rotator_instance.notify_clients("account_updated")
+    return {"status": "success", "message": f"Account #{acc_id} role set to {role}"}
+
+# ─── Listener Assignments ─────────────────────────────────────
+
+@app.get("/api/listener-assignments")
+async def get_assignments():
+    """View current listener assignment map."""
+    return await get_listener_summary()
+
+@app.post("/api/listener-assignments/rebalance")
+async def rebalance_listeners():
+    """Trigger manual listener rebalance."""
+    assignments = await auto_assign_listeners(force_rebalance=True)
+    await rotator_instance.notify_clients("listeners_rebalanced")
+    return {
+        "status": "success",
+        "message": f"Rebalanced: {len(assignments)} listeners assigned",
+        "assignments": assignments
+    }
+
+# ─── Worker Registry ──────────────────────────────────────────
+
+@app.get("/api/workers")
+async def get_workers():
+    """List all registered workers with heartbeat status."""
+    from .queue_manager import queue_manager, WORKER_HEARTBEAT_TIMEOUT
+    import time as _time
+    workers = await queue_manager.get_registered_workers()
+    now = _time.time()
+    result = []
+    for wid, info in workers.items():
+        hb = info.get("heartbeat", 0)
+        result.append({
+            "worker_id": wid,
+            "heartbeat": hb,
+            "status": "alive" if now - hb < WORKER_HEARTBEAT_TIMEOUT else "dead",
+            "seconds_since_heartbeat": int(now - hb)
+        })
+    active_consumer = await queue_manager.get_active_consumer()
+    return {
+        "active_consumer": active_consumer,
+        "workers": sorted(result, key=lambda w: w["worker_id"])
+    }
