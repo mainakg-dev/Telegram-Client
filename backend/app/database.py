@@ -86,8 +86,17 @@ async def init_db():
         for key, val in default_settings:
             await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
 
-        await db.commit()
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS group_assignments (
+            group_target TEXT PRIMARY KEY,
+            primary_session TEXT NOT NULL,
+            backup_session TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
 
+        await db.commit()
 
 
 @contextlib.asynccontextmanager
@@ -114,3 +123,39 @@ async def add_log(action: str, status: str, details: str = "", account_phone: st
             VALUES (?, ?, ?, ?, ?, ?)
         """, (action, status, details, account_phone, server_group, target))
         await db.commit()
+
+async def get_all_group_assignments() -> Dict[str, Dict[str, str]]:
+    """
+    Returns a dict mapping group_target -> {'primary': primary_session, 'backup': backup_session}
+    """
+    async with get_db() as db:
+        async with db.execute("SELECT group_target, primary_session, backup_session FROM group_assignments") as cursor:
+            rows = await cursor.fetchall()
+            return {
+                row["group_target"]: {
+                    "primary": row["primary_session"],
+                    "backup": row["backup_session"]
+                }
+                for row in rows
+            }
+
+async def save_group_assignment(group_target: str, primary_session: str, backup_session: str):
+    """
+    Inserts or updates a sticky group assignment in SQLite.
+    """
+    async with get_db() as db:
+        await db.execute("""
+            INSERT INTO group_assignments (group_target, primary_session, backup_session, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(group_target) DO UPDATE SET
+                primary_session = excluded.primary_session,
+                backup_session = excluded.backup_session,
+                updated_at = CURRENT_TIMESTAMP
+        """, (group_target, primary_session, backup_session))
+        await db.commit()
+
+async def delete_group_assignment(group_target: str):
+    async with get_db() as db:
+        await db.execute("DELETE FROM group_assignments WHERE group_target = ?", (group_target,))
+        await db.commit()
+

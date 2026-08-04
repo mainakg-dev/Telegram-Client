@@ -398,6 +398,11 @@ class ProductionWorkerNode:
                             if is_dup:
                                 return
 
+                            # Check if message is a reply to an earlier message
+                            reply_to_msg_id = None
+                            if getattr(event.message, 'reply_to', None):
+                                reply_to_msg_id = getattr(event.message.reply_to, 'reply_to_msg_id', None)
+
                             # Enqueue IMMEDIATELY after dedup
                             sender_name = str(event.sender_id or 'Unknown')
 
@@ -406,7 +411,8 @@ class ProductionWorkerNode:
                                 msg_id=event.message.id,
                                 text=msg_text,
                                 sender_id=event.sender_id,
-                                sender_name=sender_name
+                                sender_name=sender_name,
+                                reply_to_msg_id=reply_to_msg_id
                             )
 
                             # Fetch sender name after enqueue (best-effort, for logging only)
@@ -512,35 +518,30 @@ class ProductionWorkerNode:
                 logger.error(f"Error resolving targets for replier '{session_name}': {e}")
 
 
-    def _find_replier_for_chat(self, chat_id: int) -> dict:
+    async def _find_primary_and_backup_for_chat(self, chat_id: int):
         """
-        Find the assigned replier account for a specific chat_id.
-        Uses chat_id → target_string → replier_session_name → account dict.
-        Returns None if no assignment found.
+        Look up primary and backup replier accounts for a target chat_id.
+        Returns (primary_account_dict, backup_account_dict).
         """
-        # Look up target_string from chat_id
-        target_str = self.chat_id_to_target.get(chat_id)
+        target_str = self.chat_id_to_target.get(chat_id) or self.chat_id_to_target.get(str(chat_id))
         if not target_str:
-            # Try as-is (might be stored differently)
-            target_str = self.chat_id_to_target.get(str(chat_id))
+            return None, None
 
-        if not target_str:
-            logger.debug(f"No target_string mapping for chat_id {chat_id}")
-            return None
+        pair_map = await queue_manager.get_group_pair_assignments(self.worker_id)
+        pair = pair_map.get(target_str)
+        if not pair:
+            # Fall back to single target_to_replier mapping if pair_map not available
+            primary_sname = self.target_to_replier.get(target_str)
+            primary_acc = self.replier_accounts_cache.get(primary_sname) if primary_sname else None
+            return primary_acc, None
 
-        # Look up replier session for this target
-        replier_session = self.target_to_replier.get(target_str)
-        if not replier_session:
-            logger.debug(f"No replier assigned for target '{target_str}'")
-            return None
+        primary_sname = pair.get("primary")
+        backup_sname = pair.get("backup")
 
-        # Look up account dict
-        acc = self.replier_accounts_cache.get(replier_session)
-        if not acc:
-            logger.debug(f"Replier '{replier_session}' not in local cache")
-            return None
+        primary_acc = self.replier_accounts_cache.get(primary_sname) if primary_sname else None
+        backup_acc = self.replier_accounts_cache.get(backup_sname) if backup_sname else None
 
-        return acc
+        return primary_acc, backup_acc
 
     async def _ensure_replier_resolved(self, account: dict, chat_id: int):
         """
@@ -585,69 +586,100 @@ class ProductionWorkerNode:
 
     async def _dispatch_reply(self, job: dict, msg_to_send: str):
         """
-        Handles a single reply job. Acquires the per-group lock first, then the
-        global semaphore, so at most MAX_CONCURRENT_REPLIES are in-flight and
-        no two replies target the same group simultaneously.
+        Handles a single reply job enforcing production rules:
+        - Primary vs. Backup failover on FloodWait/error
+        - Rule 2: Max 5 consecutive thread replies per account
+        - Rule 4: Backup accounts never reply to in-thread replies (top-level only)
         """
         chat_id = job.get("chat_id")
         msg_id = job.get("msg_id")
+        is_reply = job.get("is_reply", False)
+
         group_lock = self._get_group_lock(chat_id)
 
         async with group_lock:            # per-group: 1 reply at a time
             async with self._reply_semaphore:  # global cap
-                # Step 1: Try to find the ASSIGNED replier for this group
-                assigned_replier = self._find_replier_for_chat(chat_id)
+                primary_acc, backup_acc = await self._find_primary_and_backup_for_chat(chat_id)
 
-                if assigned_replier:
-                    # Ensure the replier has resolved this chat entity before sending
-                    await self._ensure_replier_resolved(assigned_replier, chat_id)
+                chosen_acc = None
+                is_backup = False
 
-                    success = await engine_instance.reply_to_channel_message(
-                        assigned_replier, chat_id, msg_id, msg_to_send
-                    )
-                    if success:
-                        logger.info(
-                            f"✅ [{self.worker_id}] Replied to msg #{msg_id} in chat {chat_id} "
-                            f"via assigned replier {assigned_replier['phone']}"
-                        )
-                        await queue_manager.push_worker_log(
-                            "AUTO_REPLY", "SUCCESS",
-                            f"Replied to msg #{msg_id} in chat {chat_id} (assigned replier)",
-                            assigned_replier["phone"], assigned_replier.get("server_group"), str(chat_id)
-                        )
-                    else:
-                        logger.warning(
-                            f"Assigned replier {assigned_replier['phone']} failed for chat {chat_id}. Re-queueing."
-                        )
-                        await queue_manager.requeue_for_retry(job)
-                else:
-                    # Fallback: no assignment found — use any available replier
+                # 1. Determine whether Primary or Backup account should handle this
+                if primary_acc and primary_acc.get("status") not in ("FLOOD_WAIT", "UNAUTHORIZED", "DISABLED", "ERROR"):
+                    chosen_acc = primary_acc
+                elif backup_acc and backup_acc.get("status") not in ("FLOOD_WAIT", "UNAUTHORIZED", "DISABLED", "ERROR"):
+                    chosen_acc = backup_acc
+                    is_backup = True
+                    logger.info(f"🔄 Primary account unavailable/floodwaited for chat {chat_id}. Failing over to Backup account {backup_acc['phone']}")
+                elif primary_acc:
+                    chosen_acc = primary_acc
+
+                if not chosen_acc:
                     replier_accounts = self.load_accounts_by_role("REPLIER")
                     if not replier_accounts:
                         logger.warning(f"[{self.worker_id}] No replier accounts available. Re-queueing job.")
                         await queue_manager.requeue_for_retry(job)
                         return
+                    chosen_acc = self._get_next_rr_account(replier_accounts)
 
-                    fallback_acc = self._get_next_rr_account(replier_accounts)
-                    if not fallback_acc:
-                        await queue_manager.requeue_for_retry(job)
-                        return
+                session_name = chosen_acc["session_name"]
 
-                    success = await engine_instance.reply_to_channel_message(
-                        fallback_acc, chat_id, msg_id, msg_to_send
+                # 2. Rule 4: Backup account will NOT reply to a message that is itself a reply to another message
+                if is_backup and is_reply:
+                    logger.info(
+                        f"⏭️ Backup account {chosen_acc['phone']} skipping msg #{msg_id} in chat {chat_id} "
+                        f"(Backup accounts only reply to top-level messages)."
                     )
-                    if success:
-                        logger.info(
-                            f"✅ [{self.worker_id}] Replied to msg #{msg_id} in chat {chat_id} "
-                            f"via FALLBACK replier {fallback_acc['phone']}"
+                    await queue_manager.push_worker_log(
+                        "AUTO_REPLY", "INFO",
+                        f"Skipped in-thread msg #{msg_id} in chat {chat_id} (Backup account restriction)",
+                        chosen_acc["phone"], chosen_acc.get("server_group"), str(chat_id)
+                    )
+                    return
+
+                # 3. Rule 2: Max 5 consecutive thread replies per account
+                if is_reply:
+                    consecutive_count = await queue_manager.get_consecutive_thread_replies(chat_id, session_name)
+                    if consecutive_count >= 5:
+                        logger.warning(
+                            f"⚠️ Reached max consecutive thread replies (5) for account {chosen_acc['phone']} in chat {chat_id}. Skipping msg #{msg_id}."
                         )
                         await queue_manager.push_worker_log(
-                            "AUTO_REPLY", "SUCCESS",
-                            f"Replied to msg #{msg_id} in chat {chat_id} (fallback replier)",
-                            fallback_acc["phone"], fallback_acc.get("server_group"), str(chat_id)
+                            "AUTO_REPLY", "WARNING",
+                            f"Skipped msg #{msg_id} in chat {chat_id}: Reached max 5 consecutive thread replies",
+                            chosen_acc["phone"], chosen_acc.get("server_group"), str(chat_id)
                         )
-                    else:
-                        await queue_manager.requeue_for_retry(job)
+                        return
+                else:
+                    # Reset counter on top-level message
+                    await queue_manager.reset_consecutive_thread_replies(chat_id, session_name)
+
+                # 4. Ensure account entity is resolved (warms Telethon entity cache)
+                await self._ensure_replier_resolved(chosen_acc, chat_id)
+
+                success = await engine_instance.reply_to_channel_message(
+                    chosen_acc, chat_id, msg_id, msg_to_send
+                )
+
+                if success:
+                    if is_reply:
+                        await queue_manager.increment_consecutive_thread_replies(chat_id, session_name)
+
+                    acc_role_str = "backup" if is_backup else "primary"
+                    logger.info(
+                        f"✅ [{self.worker_id}] Replied to msg #{msg_id} in chat {chat_id} "
+                        f"via {acc_role_str} replier {chosen_acc['phone']}"
+                    )
+                    await queue_manager.push_worker_log(
+                        "AUTO_REPLY", "SUCCESS",
+                        f"Replied to msg #{msg_id} in chat {chat_id} ({acc_role_str} replier)",
+                        chosen_acc["phone"], chosen_acc.get("server_group"), str(chat_id)
+                    )
+                else:
+                    logger.warning(
+                        f"Replier {chosen_acc['phone']} failed for chat {chat_id}. Re-queueing."
+                    )
+                    await queue_manager.requeue_for_retry(job)
 
     async def consumer_loop(self):
         """

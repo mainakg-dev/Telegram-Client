@@ -242,21 +242,14 @@ async def auto_assign_repliers(
 ) -> Dict[str, List[str]]:
     """
     Assigns target groups to REPLIER accounts for a specific worker.
-    Each group gets exactly 1 replier on this worker.
-    Each replier handles ~3 groups (100 groups / 32 repliers).
-
-    This ensures minimum accounts replying per group:
-    - 1 replier per group per server
-    - With 2 servers: total 2 accounts ever reply in any group
-
-    Args:
-        worker_id: The worker to assign repliers for (e.g., "worker-1")
-        targets: Optional list of target groups. If None, reads from Redis.
-        force_rebalance: If True, recalculates even if existing assignments look valid.
+    STRICT POLICY: No account is reused across different groups or sessions.
+    Each group gets a unique Primary Replier and a unique Backup Replier.
 
     Returns:
-        Dict[session_name, List[group_targets]] — the replier assignment map
+        Dict[session_name, List[group_targets]] — the replier assignment map for warming entities
     """
+    from .database import get_all_group_assignments, save_group_assignment
+
     # 1. Get target groups
     if targets is None:
         targets = await queue_manager.get_active_targets()
@@ -264,20 +257,13 @@ async def auto_assign_repliers(
     if not targets:
         logger.info("No active targets — clearing replier assignments")
         await queue_manager.set_replier_assignments(worker_id, {})
+        await queue_manager.set_group_pair_assignments(worker_id, {})
         return {}
 
-    # 2. Check existing assignments
-    if not force_rebalance:
-        existing = await queue_manager.get_replier_assignments(worker_id)
-        if existing and _is_replier_assignment_valid(existing, targets):
-            logger.debug(f"Existing replier assignments for '{worker_id}' are valid — skipping rebalance")
-            return existing
-
-    # 3. Get replier accounts for this worker from local DB
+    # 2. Get replier accounts for this worker from local DB
     all_accounts = _get_all_accounts_from_db()
     healthy_accounts = _get_healthy_accounts(all_accounts)
 
-    # Filter to REPLIER role only
     replier_accounts = [
         acc for acc in healthy_accounts
         if acc.get("role", "REPLIER") == "REPLIER"
@@ -287,60 +273,117 @@ async def auto_assign_repliers(
         logger.error(f"❌ No healthy replier accounts available for worker '{worker_id}'!")
         return {}
 
-    num_repliers = len(replier_accounts)
-    num_groups = len(targets)
-
-    # 4. Distribute groups evenly across replier accounts (round-robin)
     replier_session_names = [acc["session_name"] for acc in replier_accounts]
+    replier_set = set(replier_session_names)
+
+    # 3. Read sticky assignments from SQLite
+    db_assignments = await get_all_group_assignments()
+
+    pair_map: Dict[str, Dict[str, str]] = {}
+    used_sessions: set = set()
+
+    # Pass 1: Retain valid sticky DB assignments (ensuring no session is reused across groups)
+    for group in targets:
+        if group in db_assignments:
+            p = db_assignments[group].get("primary")
+            b = db_assignments[group].get("backup")
+
+            # Ensure primary is healthy & not already claimed by another group
+            valid_p = p if (p in replier_set and p not in used_sessions) else None
+            if valid_p:
+                used_sessions.add(valid_p)
+
+            # Ensure backup is healthy, distinct, & not claimed
+            valid_b = b if (b in replier_set and b not in used_sessions and b != valid_p) else None
+            if valid_b:
+                used_sessions.add(valid_b)
+
+            if valid_p or valid_b:
+                pair_map[group] = {
+                    "primary": valid_p or valid_b,
+                    "backup": valid_b or valid_p
+                }
+
+    # Pass 2: Assign unassigned targets from remaining available (unused) accounts
+    available_sessions = [s for s in replier_session_names if s not in used_sessions]
+
+    for group in targets:
+        # Check if already has a complete distinct pair
+        if (
+            group in pair_map 
+            and pair_map[group].get("primary") 
+            and pair_map[group].get("backup") 
+            and pair_map[group]["primary"] != pair_map[group]["backup"]
+        ):
+            continue
+
+        existing_p = pair_map.get(group, {}).get("primary")
+        existing_b = pair_map.get(group, {}).get("backup")
+
+        p = existing_p
+        b = existing_b
+
+        # Assign primary if missing
+        if not p:
+            if available_sessions:
+                p = available_sessions.pop(0)
+                used_sessions.add(p)
+            else:
+                logger.warning(f"⚠️ No unused account available for Primary in group '{group}'!")
+
+        # Assign backup if missing or duplicate
+        if not b or b == p:
+            if available_sessions:
+                b = available_sessions.pop(0)
+                used_sessions.add(b)
+            else:
+                b = p  # Fall back to primary if no spare unused account available
+
+        if p:
+            pair_map[group] = {"primary": p, "backup": b or p}
+            await save_group_assignment(group, p, b or p)
+        else:
+            logger.error(f"❌ Cannot assign group '{group}': All replier accounts are already used by other groups (Strict 1-account-per-group policy).")
+
+    # 4. Build reverse assignment map: session_name -> list of groups
     assignments: Dict[str, List[str]] = {sname: [] for sname in replier_session_names}
+    for group, pair in pair_map.items():
+        p_name = pair["primary"]
+        b_name = pair["backup"]
+        if p_name and group not in assignments[p_name]:
+            assignments[p_name].append(group)
+        if b_name and b_name != p_name and group not in assignments[b_name]:
+            assignments[b_name].append(group)
 
-    for idx, group in enumerate(targets):
-        replier_sname = replier_session_names[idx % num_repliers]
-        assignments[replier_sname].append(group)
-
-    # Remove empty entries (shouldn't happen but be safe)
     assignments = {k: v for k, v in assignments.items() if v}
 
     # 5. Store in Redis
     await queue_manager.set_replier_assignments(worker_id, assignments)
+    await queue_manager.set_group_pair_assignments(worker_id, pair_map)
 
-    # Log summary
-    groups_per_replier = [len(g) for g in assignments.values()]
     logger.info(
-        f"✅ Replier assignment for '{worker_id}': {len(assignments)} repliers, "
-        f"{num_groups} groups, {min(groups_per_replier)}-{max(groups_per_replier)} groups/replier"
+        f"✅ Strict non-reusing replier assignment for '{worker_id}': {len(pair_map)} groups assigned to "
+        f"{len(used_sessions)} unique replier sessions."
     )
-    for sname, groups in assignments.items():
-        logger.debug(f"  Replier '{sname}' → {groups}")
+    for grp, pair in pair_map.items():
+        logger.info(f"  Group '{grp}' ➔ Primary: {pair['primary']} | Backup: {pair['backup']}")
 
     return assignments
 
 
-def _is_replier_assignment_valid(
-    existing: Dict[str, List[str]],
-    current_targets: List[str]
-) -> bool:
-    """Check if existing replier assignments still cover all targets."""
-    assigned_targets = set()
-    for groups in existing.values():
-        assigned_targets.update(groups)
-
-    current_set = set(current_targets)
-    if assigned_targets != current_set:
-        return False
-    return True
-
 
 def build_target_to_replier_map(assignments: Dict[str, List[str]]) -> Dict[str, str]:
     """
-    Build a reverse map: target_string → replier_session_name.
+    Build a reverse map: target_string → primary_replier_session_name.
     Used by worker to quickly look up which replier account handles a group.
     """
     reverse_map = {}
     for session_name, groups in assignments.items():
         for group in groups:
-            reverse_map[group] = session_name
+            if group not in reverse_map:
+                reverse_map[group] = session_name
     return reverse_map
+
 
 
 # ─── Summary for Dashboard ──────────────────────────────────────

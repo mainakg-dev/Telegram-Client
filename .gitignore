@@ -4,6 +4,7 @@
 *.session
 backend/data/
 api.txt
+knowledge.txt
 venv
 package-lock.json
 go-backend

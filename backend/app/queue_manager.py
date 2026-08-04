@@ -79,13 +79,23 @@ class QueueManager:
 
     # ─── Message Queue ─────────────────────────────────────────────
 
-    async def enqueue_message(self, chat_id: int, msg_id: int, text: str, sender_id: int, sender_name: str) -> bool:
+    async def enqueue_message(
+        self,
+        chat_id: int,
+        msg_id: int,
+        text: str,
+        sender_id: int,
+        sender_name: str,
+        reply_to_msg_id: Optional[int] = None
+    ) -> bool:
         payload = {
             "chat_id": chat_id,
             "msg_id": msg_id,
             "text": text,
             "sender_id": sender_id,
             "sender_name": sender_name,
+            "reply_to_msg_id": reply_to_msg_id,
+            "is_reply": reply_to_msg_id is not None,
             "retry_count": 0
         }
         json_str = json.dumps(payload)
@@ -93,14 +103,15 @@ class QueueManager:
         if self.use_redis and self.redis_client:
             try:
                 await self.redis_client.rpush("tg_message_queue", json_str)
-                logger.info(f"📥 Enqueued message to Redis: ({chat_id}, {msg_id})")
+                logger.info(f"📥 Enqueued message to Redis: ({chat_id}, {msg_id}) is_reply={payload['is_reply']}")
                 return True
             except Exception as e:
                 logger.error(f"Redis enqueue error: {e}")
 
         await self._memory_queue.put(payload)
-        logger.info(f"📥 Enqueued message to In-Memory Queue: ({chat_id}, {msg_id})")
+        logger.info(f"📥 Enqueued message to In-Memory Queue: ({chat_id}, {msg_id}) is_reply={payload['is_reply']}")
         return True
+
 
     async def dequeue_message(self, timeout: int = 1) -> Optional[Dict[str, Any]]:
         if self.use_redis and self.redis_client:
@@ -393,5 +404,73 @@ class QueueManager:
             logs.append(self._memory_state["logs_queue"].pop(0))
         return logs
 
+    # ─── Consecutive Thread Reply Counters & Pair Assignments ──────
+
+    async def get_consecutive_thread_replies(self, chat_id: Any, session_name: str) -> int:
+        redis_key = f"consecutive_thread_replies:{chat_id}:{session_name}"
+        if self.use_redis and self.redis_client:
+            try:
+                val = await self.redis_client.get(redis_key)
+                return int(val) if val else 0
+            except Exception as e:
+                logger.error(f"Redis get_consecutive_thread_replies error: {e}")
+        mem_counters = self._memory_state.setdefault("consecutive_counters", {})
+        return mem_counters.get(f"{chat_id}:{session_name}", 0)
+
+    async def increment_consecutive_thread_replies(self, chat_id: Any, session_name: str, ttl: int = 3600) -> int:
+        redis_key = f"consecutive_thread_replies:{chat_id}:{session_name}"
+        if self.use_redis and self.redis_client:
+            try:
+                new_val = await self.redis_client.incr(redis_key)
+                await self.redis_client.expire(redis_key, ttl)
+                return new_val
+            except Exception as e:
+                logger.error(f"Redis increment_consecutive_thread_replies error: {e}")
+        mem_counters = self._memory_state.setdefault("consecutive_counters", {})
+        key = f"{chat_id}:{session_name}"
+        mem_counters[key] = mem_counters.get(key, 0) + 1
+        return mem_counters[key]
+
+    async def reset_consecutive_thread_replies(self, chat_id: Any, session_name: str):
+        redis_key = f"consecutive_thread_replies:{chat_id}:{session_name}"
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.delete(redis_key)
+            except Exception as e:
+                logger.error(f"Redis reset_consecutive_thread_replies error: {e}")
+        mem_counters = self._memory_state.setdefault("consecutive_counters", {})
+        mem_counters.pop(f"{chat_id}:{session_name}", None)
+
+    async def set_group_pair_assignments(self, worker_id: str, pair_assignments: Dict[str, Dict[str, str]]):
+        """
+        Store primary/backup pair assignments for a specific worker:
+        { group_target: {"primary": session1, "backup": session2} }
+        """
+        json_str = json.dumps(pair_assignments)
+        redis_key = f"group_pair_assignments:{worker_id}"
+        if self.use_redis and self.redis_client:
+            try:
+                await self.redis_client.set(redis_key, json_str)
+            except Exception as e:
+                logger.error(f"Redis set_group_pair_assignments error: {e}")
+        self._memory_state.setdefault("pair_assignments", {})[worker_id] = pair_assignments
+
+    async def get_group_pair_assignments(self, worker_id: str) -> Dict[str, Dict[str, str]]:
+        """
+        Get primary/backup pair assignments for a specific worker:
+        { group_target: {"primary": session1, "backup": session2} }
+        """
+        redis_key = f"group_pair_assignments:{worker_id}"
+        if self.use_redis and self.redis_client:
+            try:
+                val = await self.redis_client.get(redis_key)
+                if val:
+                    return json.loads(val)
+            except Exception as e:
+                logger.error(f"Redis get_group_pair_assignments error: {e}")
+        pair_map = self._memory_state.get("pair_assignments", {})
+        return pair_map.get(worker_id, {})
+
 
 queue_manager = QueueManager()
+
