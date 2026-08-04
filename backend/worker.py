@@ -329,11 +329,24 @@ class ProductionWorkerNode:
                 except Exception:
                     pass
 
-                # Initialize resolved targets cache for this account
-                if session_name not in self.resolved_targets:
+                # Prune stale resolved targets that are no longer assigned
+                if session_name in self.resolved_targets:
+                    stale = [t for t in self.resolved_targets[session_name] if t not in current_group_set]
+                    for st in stale:
+                        self.resolved_targets[session_name].pop(st, None)
+                else:
                     self.resolved_targets[session_name] = {}
 
-                # Resolve ONLY the assigned groups for this listener
+                # Remove old handler first before updating target list
+                if session_name in self.listener_handlers:
+                    try:
+                        old_handler = self.listener_handlers.pop(session_name)
+                        client.remove_event_handler(old_handler)
+                        logger.info(f"🛑 Detached old listener handler for '{session_name}'")
+                    except Exception:
+                        pass
+
+                # Resolve remaining assigned groups
                 resolved_chats = []
                 for t in assigned_groups:
                     if t in self.resolved_targets[session_name]:
@@ -353,16 +366,12 @@ class ProductionWorkerNode:
                             self.chat_id_to_target[int(f"-100{entity_id}")] = t
                         logger.info(f"🎯 Listener '{session_name}' resolved target '{t}' (chat_id: {entity_id})")
 
+                self.listener_targets[session_name] = current_group_set
+
                 if not resolved_chats:
-                    logger.warning(f"No targets resolved for listener '{session_name}'")
+                    logger.info(f"Listener '{session_name}' has no active target groups assigned.")
                     continue
 
-                # Remove old handler if updating target list
-                if session_name in self.listener_handlers:
-                    try:
-                        client.remove_event_handler(self.listener_handlers[session_name])
-                    except Exception:
-                        pass
 
                 # Create new event handler
                 def create_handler(listener_session):

@@ -14,7 +14,8 @@ from .database import init_db, get_db, set_setting, add_log, get_setting
 from .telethon_engine import engine_instance, SESSIONS_DIR
 from .rotator import rotator_instance
 from .config import DEFAULT_API_ID, DEFAULT_API_HASH
-from .listener_assigner import auto_assign_listeners, get_listener_summary
+from .queue_manager import queue_manager
+from .listener_assigner import auto_assign_listeners, auto_assign_repliers, get_listener_summary
 
 
 class ConnectionManager:
@@ -69,14 +70,45 @@ async def _periodic_auth_cleanup():
         await asyncio.sleep(60)
         await cleanup_stale_pending_auths()
 
+async def sync_sqlite_to_redis_on_startup():
+    """
+    Flushes Redis state and populates fresh state from SQLite for workers.
+    """
+    await queue_manager.connect()
+    await queue_manager.flush_redis_state()
+
+    async with get_db() as db:
+        async with db.execute("SELECT username FROM targets WHERE is_active = 1") as cursor:
+            targets = [r["username"] for r in await cursor.fetchall() if r["username"]]
+        async with db.execute("SELECT content FROM messages WHERE is_active = 1") as cursor:
+            messages = [r["content"] for r in await cursor.fetchall() if r["content"]]
+
+    await queue_manager.set_active_targets(targets)
+    await queue_manager.set_active_messages(messages)
+    await queue_manager.set_active_consumer("worker-1")
+
+    await auto_assign_listeners(targets=targets, force_rebalance=True)
+
+    workers = await queue_manager.get_registered_workers()
+    worker_ids = list(workers.keys()) if workers else ["worker-1"]
+    for wid in worker_ids:
+        await auto_assign_repliers(worker_id=wid, targets=targets, force_rebalance=True)
+
+    logger.info(
+        f"🚀 Server Startup: Flushed Redis & synced {len(targets)} active targets, "
+        f"{len(messages)} active messages from SQLite to Redis."
+    )
+
 @asynccontextmanager
 async def lifespan(app):
     # Startup
     await init_db()
+    await sync_sqlite_to_redis_on_startup()
     cleanup_task = asyncio.create_task(_periodic_auth_cleanup())
     yield
     # Shutdown
     cleanup_task.cancel()
+
     if rotator_instance.is_running:
         await rotator_instance.stop()
     for key in list(pending_auths.keys()):
@@ -360,12 +392,18 @@ async def add_target(payload: Dict[str, str] = Body(...)):
 
 @app.delete("/api/targets/{target_id}")
 async def delete_target(target_id: int):
+    from .database import delete_group_assignment
     async with get_db() as db:
+        async with db.execute("SELECT username FROM targets WHERE id = ?", (target_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row and row["username"]:
+                await delete_group_assignment(row["username"])
         await db.execute("DELETE FROM targets WHERE id = ?", (target_id,))
         await db.commit()
     await rotator_instance.sync_state_to_redis()
     await rotator_instance.notify_clients("target_deleted")
     return {"status": "success"}
+
 
 @app.delete("/api/accounts/{acc_id}")
 async def delete_account(acc_id: int):

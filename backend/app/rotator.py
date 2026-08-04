@@ -53,13 +53,20 @@ class ShiftRotator:
             await queue_manager.set_active_targets(targets)
             await queue_manager.set_active_messages(messages)
 
-            # Check if targets changed — trigger listener reassignment
+            # Check if targets changed — trigger listener & replier reassignment in Redis
             targets_hash = str(sorted(targets))
             if targets_hash != self._last_targets_hash:
-                if self._last_targets_hash:  # Skip first sync (startup)
-                    logger.info("🔄 Target list changed — triggering listener reassignment")
-                    await auto_assign_listeners(targets=targets, force_rebalance=True)
+                logger.info("🔄 Target list changed — triggering listener & replier reassignment in Redis")
+                await auto_assign_listeners(targets=targets, force_rebalance=True)
+
+                from .listener_assigner import auto_assign_repliers
+                workers = await queue_manager.get_registered_workers()
+                worker_ids = list(workers.keys()) if workers else ["worker-1"]
+                for wid in worker_ids:
+                    await auto_assign_repliers(worker_id=wid, targets=targets, force_rebalance=True)
+
                 self._last_targets_hash = targets_hash
+
 
         except Exception as e:
             logger.error(f"Error syncing state to Redis: {e}")

@@ -279,8 +279,15 @@ async def auto_assign_repliers(
     # 3. Read sticky assignments from SQLite
     db_assignments = await get_all_group_assignments()
 
+    # Clean up SQLite DB assignments for target groups that no longer exist
+    from .database import delete_group_assignment
+    for deleted_grp in list(db_assignments.keys()):
+        if deleted_grp not in targets:
+            await delete_group_assignment(deleted_grp)
+
     pair_map: Dict[str, Dict[str, str]] = {}
     used_sessions: set = set()
+
 
     # Pass 1: Retain valid sticky DB assignments (ensuring no session is reused across groups)
     for group in targets:

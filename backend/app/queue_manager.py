@@ -56,7 +56,44 @@ class QueueManager:
             self.redis_client = None
             self.use_redis = False
 
+    async def flush_redis_state(self):
+        """
+        Clears all application state keys from Redis on server startup
+        so that fresh state can be synchronized from SQLite.
+        """
+        if self.use_redis and self.redis_client:
+            try:
+                keys_to_delete = ["active_targets", "active_messages", "active_consumer", "listener_assignments"]
+                pattern_keys = []
+                for pattern in ["replier_assignments:*", "group_pair_assignments:*"]:
+                    cursor = 0
+                    while True:
+                        cursor, found = await self.redis_client.scan(cursor, match=pattern, count=100)
+                        pattern_keys.extend(found)
+                        if cursor == 0:
+                            break
+
+                all_keys = keys_to_delete + pattern_keys
+                if all_keys:
+                    await self.redis_client.delete(*all_keys)
+                    logger.info(f"🧹 Flushed {len(all_keys)} state keys from Redis on startup.")
+            except Exception as e:
+                logger.error(f"Error flushing Redis state: {e}")
+
+        # Reset memory state as well
+        self._memory_seen.clear()
+        self._memory_state = {
+            "active_consumer": "worker-1",
+            "targets": [],
+            "messages": [],
+            "logs_queue": [],
+            "workers": {},
+            "listener_assignments": {},
+            "replier_assignments": {},
+        }
+
     # ─── Deduplication ─────────────────────────────────────────────
+
 
     async def is_duplicate_and_mark(self, chat_id: int, msg_id: int, ttl_seconds: int = 86400) -> bool:
         """
