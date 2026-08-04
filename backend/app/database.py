@@ -96,7 +96,14 @@ async def init_db():
         );
         """)
 
+        # Performance indexes
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_logs_id_desc ON logs(id DESC);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_accounts_role_status ON accounts(role, status);")
+
         await db.commit()
+
 
 
 @contextlib.asynccontextmanager

@@ -37,15 +37,22 @@ class QueueManager:
 
     async def connect(self):
         try:
-            client = aioredis.from_url(REDIS_URL, decode_responses=True)
+            client = aioredis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                health_check_interval=30,
+                socket_connect_timeout=10,
+                retry_on_timeout=True
+            )
             await client.ping()
             self.redis_client = client
             self.use_redis = True
-            logger.info(f"✅ Connected to Redis server at {REDIS_URL}")
+            logger.info(f"✅ Connected to Redis server at {REDIS_URL} (health_check_interval=30s)")
         except Exception as e:
             self.use_redis = False
             self.redis_client = None
             logger.warning(f"⚠️ Could not connect to Redis ({e}). Falling back to in-memory async queue.")
+
 
     async def disconnect(self):
         if self.redis_client:
