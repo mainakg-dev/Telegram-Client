@@ -26,6 +26,7 @@ class ShiftRotator:
         self._task: Optional[asyncio.Task] = None
         self.broadcast_callback: Optional[Callable] = None
         self._last_targets_hash: str = ""  # Track target changes for auto-reassignment
+        self._last_recovery_check: float = 0.0
 
     def set_broadcast_callback(self, callback: Callable):
         self.broadcast_callback = callback
@@ -128,26 +129,15 @@ class ShiftRotator:
     async def start(self):
         self.is_running = True
         await set_setting("is_rotator_running", "1")
-        await set_setting("shift_started_at", str(time.time()))
 
-        await queue_manager.connect()
-
-        # Set initial active consumer
-        alive_workers = await queue_manager.get_alive_worker_ids()
-        if alive_workers:
-            await queue_manager.set_active_consumer(alive_workers[0])
-        else:
+        active_consumer = await queue_manager.get_active_consumer()
+        if not active_consumer:
             await queue_manager.set_active_consumer("worker-1")
 
-        # Mark all non-disabled accounts as ACTIVE
-        async with get_db() as db:
-            await db.execute("UPDATE accounts SET status = 'ACTIVE' WHERE status != 'DISABLED' AND status != 'UNAUTHORIZED'")
-            await db.commit()
+        await set_setting("shift_started_at", str(time.time()))
 
-        await self.sync_state_to_redis()
-
-        # Trigger initial listener assignment
-        await auto_assign_listeners()
+        targets = await queue_manager.get_active_targets()
+        await auto_assign_listeners(targets=targets, force_rebalance=True)
 
         await add_log("SHIFT_START", "INFO", "Started Master Shift Rotator Service.")
 
@@ -219,6 +209,7 @@ class ShiftRotator:
 
     async def _rotation_loop(self):
         logger.info("Entering Master Shift Rotation Loop...")
+        import os
         try:
             while self.is_running:
                 shift_started_at = float(await get_setting("shift_started_at", str(time.time())))
@@ -232,6 +223,12 @@ class ShiftRotator:
                     current = await queue_manager.get_active_consumer()
                     logger.info(f"Shift completed for '{current}'. Rotating to next worker...")
                     await self.rotate_consumer()
+
+                # Dynamic env var check for account recovery interval (default 60s)
+                recovery_interval = int(os.getenv("ACCOUNT_RECOVERY_INTERVAL_SECONDS", "60"))
+                if now - self._last_recovery_check >= recovery_interval:
+                    await recover_errored_and_flood_waited_accounts()
+                    self._last_recovery_check = now
 
                 # Sync state & drain worker logs from Redis into SQLite
                 await self.sync_state_to_redis()
@@ -254,5 +251,67 @@ class ShiftRotator:
         except Exception as e:
             logger.error(f"Unexpected error in shift rotation loop: {e}")
             await add_log("ROTATOR_ERROR", "ERROR", str(e))
+
+
+async def recover_errored_and_flood_waited_accounts() -> dict:
+    """
+    Scans for accounts in 'ERROR' or expired 'FLOOD_WAIT' status and recovers them.
+    Probes ERRORED accounts with client.is_user_authorized() to test connection.
+    """
+    recovered_count = 0
+
+    # 1. Recover expired FLOOD_WAIT accounts where current time >= flood_until
+    async with get_db() as db:
+        await db.execute("""
+            UPDATE accounts 
+            SET status = 'RESTING', flood_until = 0 
+            WHERE status = 'FLOOD_WAIT' AND flood_until > 0 AND strftime('%s', 'now') >= flood_until
+        """)
+        await db.commit()
+
+        # 2. Query accounts currently in 'ERROR' status
+        async with db.execute("SELECT * FROM accounts WHERE status = 'ERROR'") as cursor:
+            errored_accounts = [dict(r) for r in await cursor.fetchall()]
+
+    if not errored_accounts:
+        return {"recovered": 0, "errored": 0}
+
+    logger.info(f"🔍 Probing {len(errored_accounts)} account(s) in ERROR status for recovery...")
+
+    from .telethon_engine import engine_instance
+
+    for acc in errored_accounts:
+        acc_id = acc["id"]
+        phone = acc.get("phone", "")
+        session_name = acc.get("session_name", "")
+
+        try:
+            client = await engine_instance.get_client_for_account(acc)
+            if client and await client.is_user_authorized():
+                async with get_db() as db:
+                    await db.execute("UPDATE accounts SET status = 'RESTING' WHERE id = ?", (acc_id,))
+                    await db.commit()
+                recovered_count += 1
+                logger.info(f"✅ Account '{phone}' ({session_name}) recovered from ERROR ➔ RESTING")
+                await add_log("RECOVERY", "INFO", f"Account recovered from ERROR to RESTING", phone)
+            else:
+                async with get_db() as db:
+                    await db.execute("UPDATE accounts SET status = 'UNAUTHORIZED' WHERE id = ?", (acc_id,))
+                    await db.commit()
+                logger.warning(f"⚠️ Account '{phone}' ({session_name}) session unauthorized during recovery probe")
+        except Exception as e:
+            logger.warning(f"Account '{phone}' ({session_name}) recovery probe failed: {e}")
+
+    if recovered_count > 0:
+        targets = await queue_manager.get_active_targets()
+        await auto_assign_listeners(targets=targets, force_rebalance=True)
+        from .listener_assigner import auto_assign_repliers
+        workers = await queue_manager.get_registered_workers()
+        worker_ids = list(workers.keys()) if workers else ["worker-1"]
+        for wid in worker_ids:
+            await auto_assign_repliers(worker_id=wid, targets=targets, force_rebalance=True)
+
+    return {"recovered": recovered_count, "remaining_errored": len(errored_accounts) - recovered_count}
+
 
 rotator_instance = ShiftRotator()

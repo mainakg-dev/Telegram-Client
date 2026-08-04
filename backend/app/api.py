@@ -429,7 +429,16 @@ async def delete_account(acc_id: int):
     await rotator_instance.notify_clients("account_deleted")
     return {"status": "success", "message": f"Account #{acc_id} deleted"}
 
+@app.post("/api/accounts/retry_errors")
+async def retry_error_accounts():
+    """Manually triggers recovery probe for all accounts in ERROR or expired FLOOD_WAIT status."""
+    from .rotator import recover_errored_and_flood_waited_accounts
+    res = await recover_errored_and_flood_waited_accounts()
+    await rotator_instance.notify_clients("accounts_recovered")
+    return {"status": "success", "data": res}
+
 # ─── Account Role Management ──────────────────────────────────
+
 
 @app.post("/api/accounts/{acc_id}/role")
 async def set_account_role(acc_id: int, payload: Dict[str, str] = Body(...)):
