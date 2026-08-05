@@ -2,6 +2,9 @@ package telethon
 
 import (
 	"context"
+	"crypto/sha1"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -15,10 +18,59 @@ import (
 	"telegram-client-backend/pkg/queue"
 	"time"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 )
+
+func convertTelethonSessionIfNeeded(sessionPath string) {
+	data, err := os.ReadFile(sessionPath)
+	if err != nil || len(data) < 16 {
+		return
+	}
+	if !strings.HasPrefix(string(data[:16]), "SQLite format 3") {
+		return // Not an SQLite file (already JSON or custom)
+	}
+
+	sqlDB, errDB := sql.Open("sqlite", sessionPath)
+	if errDB != nil {
+		return
+	}
+	defer sqlDB.Close()
+
+	var dcID int
+	var serverAddr string
+	var port int
+	var authKey []byte
+
+	row := sqlDB.QueryRow("SELECT dc_id, server_address, port, auth_key FROM sessions WHERE auth_key IS NOT NULL LIMIT 1")
+	if errScan := row.Scan(&dcID, &serverAddr, &port, &authKey); errScan == nil && len(authKey) == 256 {
+		backupPath := sessionPath + ".telethon_sqlite"
+		_ = os.WriteFile(backupPath, data, 0600)
+
+		hasher := sha1.New()
+		hasher.Write(authKey)
+		digest := hasher.Sum(nil)
+		var keyID [8]byte
+		copy(keyID[:], digest[12:20])
+
+		sessData := session.Data{
+			DC:        dcID,
+			Addr:      fmt.Sprintf("%s:%d", serverAddr, port),
+			AuthKey:   authKey,
+			AuthKeyID: keyID[:],
+		}
+
+		jsonData, errJson := json.Marshal(sessData)
+		if errJson == nil {
+			_ = os.WriteFile(sessionPath, jsonData, 0600)
+			log.Printf("🔄 Automatically converted Python Telethon SQLite session -> gotd JSON session for '%s'", filepath.Base(sessionPath))
+		}
+	}
+}
+
+
 
 type ClientEntry struct {
 	AccountID   uint
@@ -85,6 +137,8 @@ func (e *TelethonEngine) LoadAccountClientWithHandler(acc *db.Account, updateHan
 	}
 
 	sessionFile := e.GetSessionPath(acc.SessionName)
+	convertTelethonSessionIfNeeded(sessionFile)
+
 	sessionStorage := &session.FileStorage{
 		Path: sessionFile,
 	}
