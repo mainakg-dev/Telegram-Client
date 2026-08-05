@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Go Worker Node Service
+After=network.target redis-server.service
+
+[Service]
+Type=simple
+User=telegram
+WorkingDirectory=/home/telegram/Telegram-Client/go-backend
+ExecStart=/home/telegram/Telegram-Client/go-backend/bin/worker
+Restart=always
+RestartSec=5
+Environment=WORKER_ID=worker-1
+Environment=SERVER_GROUP=1
+
+[Install]
+WantedBy=multi-user.target
