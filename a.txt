@@ -1,0 +1,11 @@
+🔴 High Impact
+#	Optimization	Current Bottleneck	Expected Speedup
+1	Reduce typing simulation (3-7s → 1-3s)	Every reply wastes 3-7s on fake typing	~3-5s saved per reply
+2	Pre-connect ALL replier clients at startup	Currently lazy-loads clients on first reply (cold start = 2-5s connection delay)	Eliminates first-reply latency
+3	Remove per-group lock	Current lock serializes replies to same group — if 3 messages arrive in group X, they queue up	Parallel replies to different messages in same group
+4	Increase MAX_CONCURRENT_REPLIES to 3-5	Currently defaults to 1 — only 1 reply dispatched globally at a time	3-5x throughput
+🟡 Medium Impact
+#	Optimization	Details
+5	Pre-resolve all replier entities at startup	Currently ensureReplierResolved runs on-demand per reply. Pre-resolve all at boot
+6	Pipeline Redis operations	Batch GetActiveMessages + GetActiveConsumer + DequeueMessage into single round-trip
+7	Keep typing indicator running while queuing	Start typing action immediately on dequeue, don't wait for lock acquisition
