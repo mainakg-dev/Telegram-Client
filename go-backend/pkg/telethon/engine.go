@@ -139,7 +139,20 @@ func (e *TelethonEngine) SendReply(ctx context.Context, accID uint, targetChatID
 		return false
 	}
 
-	typingDuration := rand.Intn(5) + 3 // 3-7 seconds
+	minStr := db.GetSetting("typing_duration_min", "1")
+	maxStr := db.GetSetting("typing_duration_max", "3")
+	minSec, _ := strconv.Atoi(minStr)
+	maxSec, _ := strconv.Atoi(maxStr)
+	if minSec <= 0 {
+		minSec = 1
+	}
+	if maxSec < minSec {
+		maxSec = minSec
+	}
+	typingDuration := minSec
+	if maxSec > minSec {
+		typingDuration = rand.Intn(maxSec-minSec+1) + minSec
+	}
 	refNum := messageID
 	fullText := fmt.Sprintf("%s\n\nref_%d#", text, refNum)
 

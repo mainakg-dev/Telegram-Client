@@ -134,14 +134,11 @@ func (r *ShiftRotator) GetCurrentState() map[string]interface{} {
 	return map[string]interface{}{
 		"active_consumer":           activeConsumer,
 		"active_server":             activeServer,
-		"current_active_server":     activeServer,
 		"is_running":                isRotatorRunning,
 		"rotation_interval_minutes": rotationMin,
 		"elapsed_seconds":           int(elapsed),
 		"remaining_seconds":         int(remaining),
 		"total_shift_seconds":       int(totalShiftSeconds),
-		"shift_elapsed_seconds":     int(elapsed),
-		"shift_remaining_seconds":   int(remaining),
 		"accounts":                  accounts,
 		"targets":                   targets,
 		"messages":                  messages,
@@ -212,9 +209,6 @@ func (r *ShiftRotator) Start() {
 	} else {
 		queue.Instance.SetActiveConsumer("worker-1")
 	}
-
-	// Update accounts to ACTIVE
-	db.DB.Model(&db.Account{}).Where("status != 'DISABLED' AND status != 'UNAUTHORIZED'").Update("status", "ACTIVE")
 
 	r.SyncStateToRedis()
 	AutoAssignListeners(nil, false)

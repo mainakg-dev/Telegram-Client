@@ -56,7 +56,7 @@ func (m *WSManager) HandleWebSocket(c *gin.Context) {
 	// Send initial state upon connection
 	state := rotator.Rotator.GetCurrentState()
 	conn.WriteJSON(map[string]interface{}{
-		"type": "state_update",
+		"type": "init_state",
 		"data": state,
 	})
 

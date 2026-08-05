@@ -167,7 +167,16 @@ class TelethonEngine:
 
         ref_num = message_id
         full_message = f"{message_text}\n\nref_{ref_num}#"
-        typing_duration = random.randint(3, 7)
+        try:
+            from .database import get_setting
+            min_sec = int(await get_setting("typing_duration_min", "1"))
+            max_sec = int(await get_setting("typing_duration_max", "3"))
+        except Exception:
+            min_sec, max_sec = 1, 3
+
+        min_sec = max(1, min_sec)
+        max_sec = max(min_sec, max_sec)
+        typing_duration = random.randint(min_sec, max_sec)
 
         await safe_db_execute("UPDATE accounts SET status = 'TYPING' WHERE id = ?", (acc_id,))
         await safe_add_log("TYPING", "INFO", f"Simulating typing indicator for {typing_duration}s", phone, group, str(target_chat))

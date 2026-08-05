@@ -73,8 +73,8 @@ async def init_db():
         # Insert default settings if not exists
         default_settings = [
             ('rotation_interval_minutes', '10'),
-            ('typing_duration_min', '3'),
-            ('typing_duration_max', '7'),
+            ('typing_duration_min', '1'),
+            ('typing_duration_max', '3'),
             ('message_delay_min', '5'),
             ('message_delay_max', '15'),
             ('current_active_server', '1'),
@@ -85,6 +85,9 @@ async def init_db():
         ]
         for key, val in default_settings:
             await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
+        
+        await db.execute("INSERT INTO settings (key, value) VALUES ('typing_duration_min', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+        await db.execute("INSERT INTO settings (key, value) VALUES ('typing_duration_max', '3') ON CONFLICT(key) DO UPDATE SET value = '3'")
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS group_assignments (

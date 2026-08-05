@@ -117,8 +117,16 @@ func (w *WorkerNode) Stop() {
 }
 
 func (w *WorkerNode) loadAccountsByRole(role string) []db.Account {
-	var accounts []db.Account
-	db.DB.Where("role = ? AND status != 'DISABLED' AND status != 'UNAUTHORIZED'", role).Order("id asc").Find(&accounts)
+	var dbAccounts []db.Account
+	db.DB.Where("role = ? AND status != 'DISABLED' AND status != 'UNAUTHORIZED'", role).Order("id asc").Find(&dbAccounts)
+
+	// Filter to accounts that have a real session file on disk (matches Python behavior)
+	accounts := make([]db.Account, 0, len(dbAccounts))
+	for _, acc := range dbAccounts {
+		if telethon.Engine.HasRealSession(acc.SessionName) {
+			accounts = append(accounts, acc)
+		}
+	}
 	return accounts
 }
 
@@ -370,7 +378,7 @@ func (w *WorkerNode) dispatchReply(ctx context.Context, job queue.MessagePayload
 			queue.Instance.RequeueForRetry(job)
 			return
 		}
-		fallbackAcc := repliers[rand.Intn(len(repliers))]
+		fallbackAcc := repliers[0]
 		chosenAcc = &fallbackAcc
 	}
 

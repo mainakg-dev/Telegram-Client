@@ -45,8 +45,8 @@ func InitDB(cfg *config.Config) *gorm.DB {
 func seedDefaultSettings(cfg *config.Config) {
 	defaults := map[string]string{
 		"rotation_interval_minutes": "10",
-		"typing_duration_min":       "3",
-		"typing_duration_max":       "7",
+		"typing_duration_min":       "1",
+		"typing_duration_max":       "3",
 		"message_delay_min":         "5",
 		"message_delay_max":         "15",
 		"current_active_server":     "1",
@@ -62,6 +62,9 @@ func seedDefaultSettings(cfg *config.Config) {
 			DB.Create(&Setting{Key: k, Value: v})
 		}
 	}
+	// Always update typing duration settings to 1s and 3s
+	SetSetting("typing_duration_min", "1")
+	SetSetting("typing_duration_max", "3")
 }
 
 func GetSetting(key, defaultVal string) string {
