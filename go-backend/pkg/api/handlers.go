@@ -147,7 +147,9 @@ func SendAuthCode(c *gin.Context) {
 				phoneCodeHash = sent.PhoneCodeHash
 			} else {
 				errSend = fmt.Errorf("unexpected AuthSendCode response")
+				return errSend
 			}
+			<-ctx.Done()
 			return nil
 		})
 		if err != nil && ctx.Err() == nil {
