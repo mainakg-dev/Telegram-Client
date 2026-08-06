@@ -9,6 +9,7 @@ DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
+        # Status values: ACTIVE, TYPING, RESTING, FLOOD_WAIT, ERROR, DISABLED
         await db.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -16,7 +17,7 @@ async def init_db():
             session_name TEXT UNIQUE NOT NULL,
             server_group INTEGER NOT NULL DEFAULT 1,
             role TEXT NOT NULL DEFAULT 'REPLIER',
-            status TEXT NOT NULL DEFAULT 'RESTING', -- ACTIVE, TYPING, RESTING, FLOOD_WAIT, ERROR, DISABLED
+            status TEXT NOT NULL DEFAULT 'RESTING',
             api_id INTEGER,
             api_hash TEXT,
             flood_until INTEGER DEFAULT 0,
@@ -50,6 +51,7 @@ async def init_db():
         );
         """)
 
+        # Status values: SUCCESS, WARNING, ERROR, INFO
         await db.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,7 +60,7 @@ async def init_db():
             server_group INTEGER,
             action TEXT NOT NULL,
             target TEXT,
-            status TEXT NOT NULL, -- SUCCESS, WARNING, ERROR, INFO
+            status TEXT NOT NULL,
             details TEXT
         );
         """)
