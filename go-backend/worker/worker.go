@@ -31,8 +31,6 @@ type WorkerNode struct {
 	replierAccountsCache map[string]db.Account
 	selfIDs              map[int64]bool
 	replySemaphore       chan struct{}
-	groupLocks           map[int64]*sync.Mutex
-	groupLocksMu         sync.Mutex
 	lastListenerRefresh  int64
 }
 
@@ -49,7 +47,8 @@ func main() {
 		workerID = envID
 	}
 
-	maxReplies := 1
+	// Fix #4: Default MAX_CONCURRENT_REPLIES increased from 1 to 5
+	maxReplies := 5
 	if envMax := os.Getenv("MAX_CONCURRENT_REPLIES"); envMax != "" {
 		if val, err := strconv.Atoi(envMax); err == nil && val > 0 {
 			maxReplies = val
@@ -66,7 +65,6 @@ func main() {
 		replierAccountsCache: make(map[string]db.Account),
 		selfIDs:              make(map[int64]bool),
 		replySemaphore:       make(chan struct{}, maxReplies),
-		groupLocks:           make(map[int64]*sync.Mutex),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -251,10 +249,69 @@ func (w *WorkerNode) setupListeners() {
 		log.Printf("✅ Listener '%s' active and monitoring assigned groups", acc.SessionName)
 	}
 
-	// Cache selfIDs for replier accounts to avoid self-reply loops
+	// Fix #2: Pre-connect ALL replier clients at startup & cache self IDs
 	repliers := w.loadAccountsByRole("REPLIER")
 	for _, acc := range repliers {
 		w.replierAccountsCache[acc.SessionName] = acc
+
+		// Pre-connect: load client so it's ready for instant replies
+		entry, err := telethon.Engine.LoadAccountClient(&acc)
+		if err == nil && entry != nil && entry.Client != nil {
+			// Cache self ID for self-loop detection
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = entry.Client.Run(ctx, func(ctx context.Context) error {
+				api := entry.Client.API()
+				users, err := api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
+				if err == nil && len(users) > 0 {
+					if u, ok := users[0].(*tg.User); ok {
+						w.mu.Lock()
+						w.selfIDs[u.ID] = true
+						w.mu.Unlock()
+						log.Printf("🔗 Pre-connected replier '%s' (self_id: %d)", acc.SessionName, u.ID)
+					}
+				}
+				return nil
+			})
+			cancel()
+		}
+	}
+
+	// Fix #5: Pre-resolve replier targets at startup
+	w.resolveReplierTargets()
+}
+
+// Fix #5: resolveReplierTargets pre-resolves all assigned target groups for each
+// replier account so the Telegram entity cache is warm and replies don't need
+// on-demand resolution (which adds 1-3s latency on first reply).
+func (w *WorkerNode) resolveReplierTargets() {
+	assignments := queue.Instance.GetReplierAssignments(w.WorkerID)
+	if len(assignments) == 0 {
+		return
+	}
+
+	for sessionName, assignedGroups := range assignments {
+		w.mu.Lock()
+		acc, ok := w.replierAccountsCache[sessionName]
+		w.mu.Unlock()
+		if !ok {
+			continue
+		}
+
+		entry, err := telethon.Engine.LoadAccountClient(&acc)
+		if err != nil || entry == nil || entry.Client == nil {
+			continue
+		}
+
+		for _, targetStr := range assignedGroups {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			resolved, errRes := telethon.Engine.ResolveAndJoinTarget(ctx, entry.Client, targetStr)
+			cancel()
+			if errRes == nil && resolved != nil {
+				log.Printf("🔗 Replier '%s' pre-resolved target '%s' (chat_id: %d)", sessionName, targetStr, resolved.ChatID)
+			} else {
+				log.Printf("⚠️ Replier '%s' failed to pre-resolve '%s': %v", sessionName, targetStr, errRes)
+			}
+		}
 	}
 }
 
@@ -336,26 +393,9 @@ func (w *WorkerNode) findPrimaryAndBackupForChat(chatID int64) (*db.Account, *db
 	return primaryAcc, backupAcc
 }
 
-func (w *WorkerNode) getGroupLock(chatID int64) *sync.Mutex {
-	w.groupLocksMu.Lock()
-	defer w.groupLocksMu.Unlock()
-
-	if lock, ok := w.groupLocks[chatID]; ok {
-		return lock
-	}
-	lock := &sync.Mutex{}
-	w.groupLocks[chatID] = lock
-	return lock
-}
-
+// Fix #3: Removed per-group lock. Replies to different messages in the same group
+// can now proceed in parallel. Only the global semaphore limits concurrency.
 func (w *WorkerNode) dispatchReply(ctx context.Context, job queue.MessagePayload, msgToSend string) {
-	groupLock := w.getGroupLock(job.ChatID)
-	groupLock.Lock()
-	defer groupLock.Unlock()
-
-	w.replySemaphore <- struct{}{} // Acquire semaphore
-	defer func() { <-w.replySemaphore }()
-
 	primaryAcc, backupAcc := w.findPrimaryAndBackupForChat(job.ChatID)
 
 	var chosenAcc *db.Account
@@ -403,6 +443,14 @@ func (w *WorkerNode) dispatchReply(ctx context.Context, job queue.MessagePayload
 		queue.Instance.ResetConsecutiveThreadReplies(job.ChatID, sessionName)
 	}
 
+	// Fix #7: Fire typing indicator immediately BEFORE acquiring semaphore.
+	// This way "typing..." appears to users while we wait for a concurrency slot.
+	go telethon.Engine.FireTypingIndicator(chosenAcc.ID, job.ChatID)
+
+	// Acquire global semaphore (limits total concurrent replies)
+	w.replySemaphore <- struct{}{}
+	defer func() { <-w.replySemaphore }()
+
 	w.ensureReplierResolved(ctx, chosenAcc, job.ChatID)
 
 	success := telethon.Engine.SendReply(ctx, chosenAcc.ID, job.ChatID, job.MsgID, msgToSend)
@@ -430,8 +478,8 @@ func (w *WorkerNode) consumerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			// Check if active consumer matches this worker ID
-			activeConsumer := queue.Instance.GetActiveConsumer()
+			// Fix #6: Pipeline — fetch active_consumer + active_messages in single Redis round-trip
+			activeConsumer, msgs := queue.Instance.GetConsumerAndMessages()
 			if activeConsumer != w.WorkerID {
 				time.Sleep(2 * time.Second)
 				continue
@@ -448,7 +496,6 @@ func (w *WorkerNode) consumerLoop(ctx context.Context) {
 				continue
 			}
 
-			msgs := queue.Instance.GetActiveMessages()
 			if len(msgs) == 0 {
 				log.Printf("⚠️ [%s] No messages available. Re-queueing job.", w.WorkerID)
 				queue.Instance.RequeueForRetry(*job)

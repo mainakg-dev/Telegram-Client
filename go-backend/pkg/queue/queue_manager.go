@@ -654,3 +654,43 @@ func (qm *QueueManager) FlushRedisState() {
 	qm.memQueue = make([]MessagePayload, 0)
 }
 
+// ─── Pipeline Methods (Performance) ──────────────────────────────
+
+// GetConsumerAndMessages fetches active_consumer and active_messages in a single
+// Redis pipeline round-trip instead of two separate calls.
+func (qm *QueueManager) GetConsumerAndMessages() (string, []string) {
+	if qm.useRedis && qm.redisClient != nil {
+		ctx := context.Background()
+		pipe := qm.redisClient.Pipeline()
+		consumerCmd := pipe.Get(ctx, "active_consumer")
+		messagesCmd := pipe.Get(ctx, "active_messages")
+		_, _ = pipe.Exec(ctx)
+
+		consumer := ""
+		if val, err := consumerCmd.Result(); err == nil && val != "" {
+			consumer = val
+		}
+
+		var messages []string
+		if val, err := messagesCmd.Result(); err == nil && val != "" {
+			_ = json.Unmarshal([]byte(val), &messages)
+		}
+
+		if consumer == "" {
+			consumer = "worker-1"
+		}
+		if messages == nil {
+			messages = make([]string, 0)
+		}
+		return consumer, messages
+	}
+
+	// Fallback to in-memory
+	qm.mu.Lock()
+	defer qm.mu.Unlock()
+	consumer := qm.memActiveCons
+	if consumer == "" {
+		consumer = "worker-1"
+	}
+	return consumer, qm.memMessages
+}

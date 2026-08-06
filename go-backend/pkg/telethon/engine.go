@@ -285,6 +285,30 @@ func (e *TelethonEngine) SendReply(ctx context.Context, accID uint, targetChatID
 	return true
 }
 
+// FireTypingIndicator sends a non-blocking typing action to the target chat.
+// Called early in the dispatch pipeline so "typing..." appears while concurrency
+// slots are being acquired. This is fire-and-forget — errors are silently ignored.
+func (e *TelethonEngine) FireTypingIndicator(accID uint, targetChatID int64) {
+	e.mu.RLock()
+	entry, ok := e.clients[accID]
+	e.mu.RUnlock()
+
+	if !ok || entry == nil || entry.Client == nil {
+		return
+	}
+
+	api := entry.Client.API()
+	inputPeer := resolvePeerFromID(targetChatID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, _ = api.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
+		Peer:   inputPeer,
+		Action: &tg.SendMessageTypingAction{},
+	})
+}
+
 func (e *TelethonEngine) DisconnectAccount(accID uint) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
