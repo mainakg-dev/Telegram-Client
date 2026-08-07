@@ -68,16 +68,49 @@ func AutoAssignListeners(targets []string, forceRebalance bool) map[string][]str
 
 	selected := candidates[:actualListeners]
 	listenerSessions := make([]string, len(selected))
+	healthyListenerSet := make(map[string]bool)
 	assignments := make(map[string][]string)
 	for i, acc := range selected {
 		listenerSessions[i] = acc.SessionName
+		healthyListenerSet[acc.SessionName] = true
 		assignments[acc.SessionName] = make([]string, 0)
 	}
 
-	// Round-robin assignment
-	for idx, group := range targets {
+	dbAssignments := db.GetAllListenerAssignments()
+
+	// Clean up deleted target groups from SQLite
+	targetSet := make(map[string]bool)
+	for _, g := range targets {
+		targetSet[g] = true
+	}
+	for deletedGroup := range dbAssignments {
+		if !targetSet[deletedGroup] {
+			db.DeleteListenerAssignment(deletedGroup)
+		}
+	}
+
+	unassignedGroups := make([]string, 0)
+
+	// Retain valid sticky DB assignments if session is in selected listeners
+	for _, group := range targets {
+		if assignedSession, ok := dbAssignments[group]; ok && healthyListenerSet[assignedSession] && !forceRebalance {
+			assignments[assignedSession] = append(assignments[assignedSession], group)
+		} else {
+			unassignedGroups = append(unassignedGroups, group)
+		}
+	}
+
+	// Round-robin assign remaining unassigned groups among selected listeners
+	for idx, group := range unassignedGroups {
 		sname := listenerSessions[idx%actualListeners]
 		assignments[sname] = append(assignments[sname], group)
+	}
+
+	// Persist all listener assignments to SQLite DB
+	for sname, groups := range assignments {
+		for _, group := range groups {
+			db.SaveListenerAssignment(group, sname)
+		}
 	}
 
 	// Update DB roles

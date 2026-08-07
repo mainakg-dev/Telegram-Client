@@ -56,3 +56,10 @@ type GroupAssignment struct {
 	UpdatedAt      time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"updated_at"`
 }
 
+type ListenerAssignment struct {
+	GroupTarget     string    `gorm:"primaryKey" json:"group_target"`
+	ListenerSession string    `gorm:"not null" json:"listener_session"`
+	CreatedAt       time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
+	UpdatedAt       time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+

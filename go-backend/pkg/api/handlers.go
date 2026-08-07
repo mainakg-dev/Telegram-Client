@@ -454,6 +454,7 @@ func DeleteTarget(c *gin.Context) {
 	var target db.Target
 	if err := db.DB.First(&target, id).Error; err == nil && target.Username != "" {
 		db.DeleteGroupAssignment(target.Username)
+		db.DeleteListenerAssignment(target.Username)
 	}
 
 	db.DB.Delete(&db.Target{}, id)

@@ -155,6 +155,17 @@ func (w *WorkerNode) handleIncomingMessage(msg *tg.Message, handlerStartTime int
 		}
 	}
 
+	w.mu.Lock()
+	_, isMonitored := w.chatIDToTarget[chatID]
+	if !isMonitored {
+		_, isMonitored = w.chatIDToTarget[-chatID]
+	}
+	w.mu.Unlock()
+
+	if !isMonitored {
+		return
+	}
+
 	var senderID int64
 	if msg.FromID != nil {
 		switch f := msg.FromID.(type) {
@@ -413,14 +424,8 @@ func (w *WorkerNode) dispatchReply(ctx context.Context, job queue.MessagePayload
 	}
 
 	if chosenAcc == nil {
-		repliers := w.loadAccountsByRole("REPLIER")
-		if len(repliers) == 0 {
-			log.Printf("⚠️ [%s] No replier accounts available. Re-queueing job.", w.WorkerID)
-			queue.Instance.RequeueForRetry(job)
-			return
-		}
-		fallbackAcc := repliers[0]
-		chosenAcc = &fallbackAcc
+		log.Printf("⚠️ [%s] No assigned replier for chat %d. Dropping job.", w.WorkerID, job.ChatID)
+		return
 	}
 
 	sessionName := chosenAcc.SessionName

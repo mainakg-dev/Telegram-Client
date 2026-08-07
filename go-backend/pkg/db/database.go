@@ -22,7 +22,7 @@ func InitDB(cfg *config.Config) *gorm.DB {
 	}
 
 	// Auto migrate tables
-	err = database.AutoMigrate(&Account{}, &Message{}, &Target{}, &Log{}, &Setting{}, &GroupAssignment{})
+	err = database.AutoMigrate(&Account{}, &Message{}, &Target{}, &Log{}, &Setting{}, &GroupAssignment{}, &ListenerAssignment{})
 	if err != nil {
 		log.Printf("⚠️ AutoMigrate warning: %v", err)
 	}
@@ -127,5 +127,30 @@ func SaveGroupAssignment(target, primary, backup string) error {
 
 func DeleteGroupAssignment(target string) error {
 	return DB.Where("group_target = ?", target).Delete(&GroupAssignment{}).Error
+}
+
+func GetAllListenerAssignments() map[string]string {
+	var list []ListenerAssignment
+	res := DB.Find(&list)
+	out := make(map[string]string)
+	if res.Error == nil {
+		for _, item := range list {
+			out[item.GroupTarget] = item.ListenerSession
+		}
+	}
+	return out
+}
+
+func SaveListenerAssignment(target, listenerSession string) error {
+	la := ListenerAssignment{
+		GroupTarget:     target,
+		ListenerSession: listenerSession,
+		UpdatedAt:       time.Now(),
+	}
+	return DB.Save(&la).Error
+}
+
+func DeleteListenerAssignment(target string) error {
+	return DB.Where("group_target = ?", target).Delete(&ListenerAssignment{}).Error
 }
 
