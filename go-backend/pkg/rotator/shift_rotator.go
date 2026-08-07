@@ -287,12 +287,19 @@ func RecoverErroredAndFloodWaitedAccounts() map[string]interface{} {
 	now := time.Now().Unix()
 
 	// 1. Recover expired FLOOD_WAIT accounts where current time >= flood_until
-	db.DB.Model(&db.Account{}).
-		Where("status = 'FLOOD_WAIT' AND flood_until > 0 AND ? >= flood_until", now).
-		Updates(map[string]interface{}{
-			"status":      "RESTING",
-			"flood_until": 0,
-		})
+	var floodAccounts []db.Account
+	db.DB.Where("status = 'FLOOD_WAIT' AND flood_until > 0 AND ? >= flood_until", now).Find(&floodAccounts)
+	if len(floodAccounts) > 0 {
+		for _, acc := range floodAccounts {
+			log.Printf("⏳ Recovered FLOOD_WAIT account '%s' (%s) ➔ RESTING", acc.Phone, acc.SessionName)
+		}
+		db.DB.Model(&db.Account{}).
+			Where("status = 'FLOOD_WAIT' AND flood_until > 0 AND ? >= flood_until", now).
+			Updates(map[string]interface{}{
+				"status":      "RESTING",
+				"flood_until": 0,
+			})
+	}
 
 	// 2. Query accounts currently in 'ERROR' status
 	var erroredAccounts []db.Account
@@ -302,9 +309,10 @@ func RecoverErroredAndFloodWaitedAccounts() map[string]interface{} {
 		return map[string]interface{}{"recovered": 0, "errored": 0}
 	}
 
-	log.Printf("🔍 Probing %d account(s) in ERROR status for recovery...", len(erroredAccounts))
+	log.Printf("🔍 [Account Recovery] Probing %d account(s) in ERROR status...", len(erroredAccounts))
 
 	for _, acc := range erroredAccounts {
+		log.Printf("⏳ Probing ERROR account '%s' (%s)...", acc.Phone, acc.SessionName)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		entry, err := telethon.Engine.LoadAccountClient(&acc)
 		if err == nil && entry != nil && entry.Client != nil {
@@ -322,15 +330,15 @@ func RecoverErroredAndFloodWaitedAccounts() map[string]interface{} {
 			if errMe == nil && me != nil {
 				db.UpdateAccountStatus(acc.ID, "RESTING")
 				recoveredCount++
-				log.Printf("✅ Account '%s' (%s) recovered from ERROR ➔ RESTING", acc.Phone, acc.SessionName)
+				log.Printf("✅ Account '%s' (%s) successfully recovered from ERROR ➔ RESTING (self_id: %d)", acc.Phone, acc.SessionName, me.ID)
 				db.AddLog("RECOVERY", "INFO", "Account recovered from ERROR to RESTING", acc.Phone, acc.ServerGroup, "")
 			} else {
 				db.UpdateAccountStatus(acc.ID, "UNAUTHORIZED")
-				log.Printf("⚠️ Account '%s' (%s) session unauthorized during recovery probe: %v", acc.Phone, acc.SessionName, errMe)
+				log.Printf("⚠️ Account '%s' (%s) recovery failed: session unauthorized (%v) ➔ UNAUTHORIZED", acc.Phone, acc.SessionName, errMe)
 			}
 		} else {
 			cancel()
-			log.Printf("Account '%s' (%s) recovery probe failed: %v", acc.Phone, acc.SessionName, err)
+			log.Printf("⚠️ Account '%s' (%s) recovery probe client load failed: %v", acc.Phone, acc.SessionName, err)
 		}
 	}
 

@@ -99,9 +99,10 @@ func (w *WorkerNode) Start(ctx context.Context) {
 	w.refreshReplierAssignments()
 	w.lastListenerRefresh = time.Now().Unix()
 
-	// Start Heartbeat and Consumer Loop concurrently
+	// Start Heartbeat, Consumer, and Account Recovery Loops concurrently
 	go w.heartbeatLoop(ctx)
 	go w.consumerLoop(ctx)
+	go w.recoveryLoop(ctx)
 
 	<-ctx.Done()
 	w.Stop()
@@ -243,6 +244,7 @@ func (w *WorkerNode) setupListeners() {
 		}
 
 		// Resolve and join assigned target groups
+		assignedChatIDs := make(map[int64]bool)
 		for _, targetStr := range assignedGroups {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			resolved, errRes := telethon.Engine.ResolveAndJoinTarget(ctx, acc.ID, entry.Client, targetStr)
@@ -251,10 +253,18 @@ func (w *WorkerNode) setupListeners() {
 				w.mu.Lock()
 				w.chatIDToTarget[resolved.ChatID] = targetStr
 				w.mu.Unlock()
+				assignedChatIDs[resolved.ChatID] = true
 				log.Printf("🎯 Listener '%s' resolved target '%s' (chat_id: %d)", acc.SessionName, targetStr, resolved.ChatID)
 			} else {
 				log.Printf("⚠️ Listener '%s' failed to resolve target '%s': %v", acc.SessionName, targetStr, errRes)
 			}
+		}
+
+		// Leave any unassigned groups for this listener account
+		if len(assignedChatIDs) > 0 {
+			ctxLeave, cancelLeave := context.WithTimeout(context.Background(), 30*time.Second)
+			telethon.Engine.LeaveUnassignedGroups(ctxLeave, entry.Client, acc.SessionName, assignedChatIDs)
+			cancelLeave()
 		}
 
 		log.Printf("✅ Listener '%s' active and monitoring assigned groups", acc.SessionName)
@@ -525,6 +535,20 @@ func (w *WorkerNode) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			queue.Instance.SendHeartbeat(w.WorkerID)
+		}
+	}
+}
+
+func (w *WorkerNode) recoveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rotator.RecoverErroredAndFloodWaitedAccounts()
 		}
 	}
 }

@@ -575,6 +575,42 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, accID uint, c
 	return nil, fmt.Errorf("could not resolve target entity for '%s'", targetStr)
 }
 
+func (e *TelethonEngine) LeaveUnassignedGroups(ctx context.Context, client *telegram.Client, sessionName string, assignedChatIDs map[int64]bool) {
+	api := client.API()
+
+	dialogsRes, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{Limit: 200})
+	if err != nil || dialogsRes == nil {
+		return
+	}
+
+	var chats []tg.ChatClass
+	if d, ok := dialogsRes.(*tg.MessagesDialogs); ok {
+		chats = d.Chats
+	} else if ds, ok := dialogsRes.(*tg.MessagesDialogsSlice); ok {
+		chats = ds.Chats
+	}
+
+	for _, chat := range chats {
+		if ch, ok := chat.(*tg.Channel); ok {
+			chatID := -1000000000000 - ch.ID
+			if !assignedChatIDs[chatID] && !assignedChatIDs[ch.ID] {
+				if !ch.Left {
+					_, errLeave := api.ChannelsLeaveChannel(ctx, &tg.InputChannel{
+						ChannelID:  ch.ID,
+						AccessHash: ch.AccessHash,
+					})
+					if errLeave == nil {
+						log.Printf("🧹 Listener '%s' left unassigned group '%s' (chat_id: %d)", sessionName, ch.Title, chatID)
+					} else {
+						log.Printf("⚠️ Listener '%s' failed to leave unassigned group '%s': %v", sessionName, ch.Title, errLeave)
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+			}
+		}
+	}
+}
+
 func parseChatEntity(ctx context.Context, api *tg.Client, chat tg.ChatClass) (*ResolvedEntity, error) {
 	switch c := chat.(type) {
 	case *tg.Channel:
