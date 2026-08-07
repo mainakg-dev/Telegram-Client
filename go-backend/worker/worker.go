@@ -234,7 +234,7 @@ func (w *WorkerNode) setupListeners() {
 		// Resolve and join assigned target groups
 		for _, targetStr := range assignedGroups {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			resolved, errRes := telethon.Engine.ResolveAndJoinTarget(ctx, entry.Client, targetStr)
+			resolved, errRes := telethon.Engine.ResolveAndJoinTarget(ctx, acc.ID, entry.Client, targetStr)
 			cancel()
 			if errRes == nil && resolved != nil {
 				w.mu.Lock()
@@ -259,20 +259,21 @@ func (w *WorkerNode) setupListeners() {
 		if err == nil && entry != nil && entry.Client != nil {
 			// Cache self ID for self-loop detection
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = entry.Client.Run(ctx, func(ctx context.Context) error {
-				api := entry.Client.API()
-				users, err := api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
-				if err == nil && len(users) > 0 {
-					if u, ok := users[0].(*tg.User); ok {
-						w.mu.Lock()
-						w.selfIDs[u.ID] = true
-						w.mu.Unlock()
-						log.Printf("🔗 Pre-connected replier '%s' (self_id: %d)", acc.SessionName, u.ID)
-					}
-				}
-				return nil
-			})
+			api := entry.Client.API()
+			users, errUsers := api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
 			cancel()
+			if errUsers == nil && len(users) > 0 {
+				if u, ok := users[0].(*tg.User); ok {
+					w.mu.Lock()
+					w.selfIDs[u.ID] = true
+					w.mu.Unlock()
+					log.Printf("🔗 Pre-connected replier '%s' (self_id: %d)", acc.SessionName, u.ID)
+				}
+			} else if errUsers != nil {
+				log.Printf("⚠️ Replier '%s' pre-connect get self_id failed: %v", acc.SessionName, errUsers)
+			}
+		} else if err != nil {
+			log.Printf("⚠️ Replier '%s' pre-connect failed: %v", acc.SessionName, err)
 		}
 	}
 
@@ -304,7 +305,7 @@ func (w *WorkerNode) resolveReplierTargets() {
 
 		for _, targetStr := range assignedGroups {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			resolved, errRes := telethon.Engine.ResolveAndJoinTarget(ctx, entry.Client, targetStr)
+			resolved, errRes := telethon.Engine.ResolveAndJoinTarget(ctx, acc.ID, entry.Client, targetStr)
 			cancel()
 			if errRes == nil && resolved != nil {
 				log.Printf("🔗 Replier '%s' pre-resolved target '%s' (chat_id: %d)", sessionName, targetStr, resolved.ChatID)
@@ -332,7 +333,7 @@ func (w *WorkerNode) ensureReplierResolved(ctx context.Context, acc *db.Account,
 		return
 	}
 
-	res, err := telethon.Engine.ResolveAndJoinTarget(ctx, entry.Client, targetStr)
+	res, err := telethon.Engine.ResolveAndJoinTarget(ctx, acc.ID, entry.Client, targetStr)
 	if err == nil && res != nil {
 		log.Printf("🔗 On-demand: Replier '%s' resolved target '%s' (chat_id: %d)", acc.SessionName, targetStr, res.ChatID)
 	}

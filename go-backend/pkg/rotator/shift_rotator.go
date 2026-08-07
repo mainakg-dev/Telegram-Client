@@ -309,20 +309,15 @@ func RecoverErroredAndFloodWaitedAccounts() map[string]interface{} {
 		entry, err := telethon.Engine.LoadAccountClient(&acc)
 		if err == nil && entry != nil && entry.Client != nil {
 			var me *tg.User
-			errMe := entry.Client.Run(ctx, func(ctx context.Context) error {
-				api := entry.Client.API()
-				u, err := api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
-				if err != nil {
-					return err
-				}
-				if len(u) > 0 {
-					if user, ok := u[0].(*tg.User); ok {
-						me = user
-					}
-				}
-				return nil
-			})
+			api := entry.Client.API()
+			u, errMe := api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
 			cancel()
+
+			if errMe == nil && len(u) > 0 {
+				if user, ok := u[0].(*tg.User); ok {
+					me = user
+				}
+			}
 
 			if errMe == nil && me != nil {
 				db.UpdateAccountStatus(acc.ID, "RESTING")
@@ -331,7 +326,7 @@ func RecoverErroredAndFloodWaitedAccounts() map[string]interface{} {
 				db.AddLog("RECOVERY", "INFO", "Account recovered from ERROR to RESTING", acc.Phone, acc.ServerGroup, "")
 			} else {
 				db.UpdateAccountStatus(acc.ID, "UNAUTHORIZED")
-				log.Printf("⚠️ Account '%s' (%s) session unauthorized during recovery probe", acc.Phone, acc.SessionName)
+				log.Printf("⚠️ Account '%s' (%s) session unauthorized during recovery probe: %v", acc.Phone, acc.SessionName, errMe)
 			}
 		} else {
 			cancel()

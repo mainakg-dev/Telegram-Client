@@ -77,6 +77,7 @@ type ClientEntry struct {
 	Phone       string
 	SessionName string
 	Client      *telegram.Client
+	Ctx         context.Context
 	Cancel      context.CancelFunc
 	AuthStatus  string
 }
@@ -84,6 +85,7 @@ type ClientEntry struct {
 type TelethonEngine struct {
 	mu          sync.RWMutex
 	clients     map[uint]*ClientEntry
+	peerCache   map[uint]map[int64]tg.InputPeerClass
 	sessionsDir string
 }
 
@@ -92,10 +94,30 @@ var Engine *TelethonEngine
 func InitEngine(cfg *config.Config) *TelethonEngine {
 	e := &TelethonEngine{
 		clients:     make(map[uint]*ClientEntry),
+		peerCache:   make(map[uint]map[int64]tg.InputPeerClass),
 		sessionsDir: cfg.SessionsDir,
 	}
 	Engine = e
 	return e
+}
+
+func (e *TelethonEngine) SetPeerCache(accID uint, chatID int64, peer tg.InputPeerClass) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.peerCache[accID] == nil {
+		e.peerCache[accID] = make(map[int64]tg.InputPeerClass)
+	}
+	e.peerCache[accID][chatID] = peer
+}
+
+func (e *TelethonEngine) GetPeerCache(accID uint, chatID int64) (tg.InputPeerClass, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if accMap, ok := e.peerCache[accID]; ok {
+		peer, ok := accMap[chatID]
+		return peer, ok
+	}
+	return nil, false
 }
 
 func (e *TelethonEngine) GetSessionPath(sessionName string) string {
@@ -130,11 +152,15 @@ func (e *TelethonEngine) LoadAccountClient(acc *db.Account) (*ClientEntry, error
 
 func (e *TelethonEngine) LoadAccountClientWithHandler(acc *db.Account, updateHandler telegram.UpdateHandler) (*ClientEntry, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	if entry, ok := e.clients[acc.ID]; ok {
-		return entry, nil
+		if entry.Ctx.Err() == nil {
+			e.mu.Unlock()
+			return entry, nil
+		}
+		entry.Cancel()
+		delete(e.clients, acc.ID)
 	}
+	e.mu.Unlock()
 
 	sessionFile := e.GetSessionPath(acc.SessionName)
 	convertTelethonSessionIfNeeded(sessionFile)
@@ -168,21 +194,54 @@ func (e *TelethonEngine) LoadAccountClientWithHandler(acc *db.Account, updateHan
 		Phone:       acc.Phone,
 		SessionName: acc.SessionName,
 		Client:      client,
+		Ctx:         ctx,
 		Cancel:      cancel,
 		AuthStatus:  acc.Status,
 	}
 
+	ready := make(chan struct{})
+	var runErr error
+	var once sync.Once
+
 	go func() {
-		err := client.Run(ctx, func(ctx context.Context) error {
-			<-ctx.Done()
+		err := client.Run(ctx, func(runCtx context.Context) error {
+			once.Do(func() {
+				close(ready)
+			})
+			<-runCtx.Done()
 			return nil
 		})
-		if err != nil && ctx.Err() == nil {
-			log.Printf("⚠️ Client %s stopped: %v", acc.Phone, err)
+		if err != nil {
+			once.Do(func() {
+				runErr = err
+				close(ready)
+			})
+			if ctx.Err() == nil {
+				log.Printf("⚠️ Client %s stopped: %v", acc.Phone, err)
+			}
 		}
+		e.mu.Lock()
+		if current, ok := e.clients[acc.ID]; ok && current == entry {
+			delete(e.clients, acc.ID)
+		}
+		e.mu.Unlock()
 	}()
 
+	select {
+	case <-ready:
+		if runErr != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to start client for %s: %w", acc.Phone, runErr)
+		}
+	case <-time.After(15 * time.Second):
+		cancel()
+		return nil, fmt.Errorf("timeout waiting for client %s to connect", acc.Phone)
+	}
+
+	e.mu.Lock()
 	e.clients[acc.ID] = entry
+	e.mu.Unlock()
+
 	return entry, nil
 }
 
@@ -237,7 +296,15 @@ func (e *TelethonEngine) SendReply(ctx context.Context, accID uint, targetChatID
 	queue.Instance.PushWorkerLog("TYPING", "INFO", fmt.Sprintf("Simulating typing indicator for %ds", typingDuration), acc.Phone, acc.ServerGroup, fmt.Sprintf("%d", targetChatID))
 
 	api := entry.Client.API()
-	inputPeer := resolvePeerFromID(targetChatID)
+	inputPeer, ok := e.GetPeerCache(accID, targetChatID)
+	if !ok || inputPeer == nil {
+		res, errRes := e.ResolveAndJoinTarget(ctx, accID, entry.Client, fmt.Sprintf("%d", targetChatID))
+		if errRes == nil && res != nil {
+			inputPeer = res.InputPeer
+		} else {
+			inputPeer = resolvePeerFromID(targetChatID)
+		}
+	}
 
 	// Send typing action
 	_, _ = api.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
@@ -258,7 +325,11 @@ func (e *TelethonEngine) SendReply(ctx context.Context, accID uint, targetChatID
 		errStr := err.Error()
 		log.Printf("❌ Error sending reply from account %s: %v", acc.Phone, err)
 
-		if strings.Contains(errStr, "FLOOD_WAIT") {
+		if strings.Contains(errStr, "connection dead") || strings.Contains(errStr, "waitSession") || strings.Contains(errStr, "context canceled") {
+			e.DisconnectAccount(accID)
+			db.UpdateAccountStatus(accID, "ERROR")
+			queue.Instance.PushWorkerLog("AUTO_REPLY", "ERROR", fmt.Sprintf("Connection dead: %s", errStr), acc.Phone, acc.ServerGroup, fmt.Sprintf("%d", targetChatID))
+		} else if strings.Contains(errStr, "FLOOD_WAIT") {
 			seconds := extractFloodWaitSeconds(errStr)
 			db.DB.Model(&db.Account{}).Where("id = ?", accID).Updates(map[string]interface{}{
 				"status":      "FLOOD_WAIT",
@@ -298,7 +369,10 @@ func (e *TelethonEngine) FireTypingIndicator(accID uint, targetChatID int64) {
 	}
 
 	api := entry.Client.API()
-	inputPeer := resolvePeerFromID(targetChatID)
+	inputPeer, ok := e.GetPeerCache(accID, targetChatID)
+	if !ok || inputPeer == nil {
+		inputPeer = resolvePeerFromID(targetChatID)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -317,6 +391,7 @@ func (e *TelethonEngine) DisconnectAccount(accID uint) {
 		entry.Cancel()
 		delete(e.clients, accID)
 	}
+	delete(e.peerCache, accID)
 }
 
 func (e *TelethonEngine) DisconnectAll() {
@@ -341,7 +416,7 @@ type ResolvedEntity struct {
 	Username  string
 }
 
-func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, client *telegram.Client, targetStr string) (*ResolvedEntity, error) {
+func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, accID uint, client *telegram.Client, targetStr string) (*ResolvedEntity, error) {
 	cleanTarget := strings.TrimSpace(targetStr)
 	if cleanTarget == "" {
 		return nil, fmt.Errorf("empty target string")
@@ -357,6 +432,32 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, client *teleg
 		} else {
 			fullID = chatID
 		}
+		if cached, ok := e.GetPeerCache(accID, fullID); ok && cached != nil {
+			return &ResolvedEntity{
+				InputPeer: cached,
+				ChatID:    fullID,
+				Title:     cleanTarget,
+			}, nil
+		}
+
+		// Search account's joined dialogs to find AccessHash for this channel/chat ID
+		dialogsRes, errDlg := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{Limit: 200})
+		if errDlg == nil && dialogsRes != nil {
+			var chats []tg.ChatClass
+			if d, ok := dialogsRes.(*tg.MessagesDialogs); ok {
+				chats = d.Chats
+			} else if ds, ok := dialogsRes.(*tg.MessagesDialogsSlice); ok {
+				chats = ds.Chats
+			}
+			for _, chat := range chats {
+				res, errParse := parseChatEntity(ctx, api, chat)
+				if errParse == nil && res != nil && res.ChatID == fullID {
+					e.SetPeerCache(accID, fullID, res.InputPeer)
+					return res, nil
+				}
+			}
+		}
+
 		peer := resolvePeerFromID(fullID)
 		return &ResolvedEntity{
 			InputPeer: peer,
@@ -380,11 +481,15 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, client *teleg
 		// Try ImportChatInvite first
 		updates, err := api.MessagesImportChatInvite(ctx, inviteHash)
 		if err == nil {
+			var res *ResolvedEntity
 			if u, ok := updates.(*tg.Updates); ok && len(u.Chats) > 0 {
-				return parseChatEntity(ctx, api, u.Chats[0])
+				res, _ = parseChatEntity(ctx, api, u.Chats[0])
+			} else if uc, ok := updates.(*tg.UpdatesCombined); ok && len(uc.Chats) > 0 {
+				res, _ = parseChatEntity(ctx, api, uc.Chats[0])
 			}
-			if uc, ok := updates.(*tg.UpdatesCombined); ok && len(uc.Chats) > 0 {
-				return parseChatEntity(ctx, api, uc.Chats[0])
+			if res != nil {
+				e.SetPeerCache(accID, res.ChatID, res.InputPeer)
+				return res, nil
 			}
 		}
 
@@ -392,7 +497,11 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, client *teleg
 		checkRes, errCheck := api.MessagesCheckChatInvite(ctx, inviteHash)
 		if errCheck == nil {
 			if already, ok := checkRes.(*tg.ChatInviteAlready); ok && already.Chat != nil {
-				return parseChatEntity(ctx, api, already.Chat)
+				res, errP := parseChatEntity(ctx, api, already.Chat)
+				if errP == nil && res != nil {
+					e.SetPeerCache(accID, res.ChatID, res.InputPeer)
+					return res, nil
+				}
 			}
 		}
 	}
@@ -410,12 +519,18 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, client *teleg
 		res, err := api.ContactsResolveUsername(ctx, usernameNoAt)
 		if err == nil && res != nil {
 			if len(res.Chats) > 0 {
-				return parseChatEntity(ctx, api, res.Chats[0])
+				parsed, errP := parseChatEntity(ctx, api, res.Chats[0])
+				if errP == nil && parsed != nil {
+					e.SetPeerCache(accID, parsed.ChatID, parsed.InputPeer)
+					return parsed, nil
+				}
 			}
 			if len(res.Users) > 0 {
 				if u, ok := res.Users[0].(*tg.User); ok {
+					peer := &tg.InputPeerUser{UserID: u.ID, AccessHash: u.AccessHash}
+					e.SetPeerCache(accID, u.ID, peer)
 					return &ResolvedEntity{
-						InputPeer: &tg.InputPeerUser{UserID: u.ID, AccessHash: u.AccessHash},
+						InputPeer: peer,
 						ChatID:    u.ID,
 						Title:     u.FirstName,
 						Username:  u.Username,
@@ -448,7 +563,11 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, client *teleg
 			if (title != "" && strings.EqualFold(title, targetLower)) ||
 				(uname != "" && strings.EqualFold(uname, targetLower)) ||
 				(title != "" && strings.Contains(strings.ToLower(title), targetLower)) {
-				return parseChatEntity(ctx, api, chat)
+				res, errP := parseChatEntity(ctx, api, chat)
+				if errP == nil && res != nil {
+					e.SetPeerCache(accID, res.ChatID, res.InputPeer)
+					return res, nil
+				}
 			}
 		}
 	}
