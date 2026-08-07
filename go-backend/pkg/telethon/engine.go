@@ -441,7 +441,7 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, accID uint, c
 		}
 
 		// Search account's joined dialogs to find AccessHash for this channel/chat ID
-		dialogsRes, errDlg := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{Limit: 200})
+		dialogsRes, errDlg := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}, Limit: 200})
 		if errDlg == nil && dialogsRes != nil {
 			var chats []tg.ChatClass
 			if d, ok := dialogsRes.(*tg.MessagesDialogs); ok {
@@ -541,7 +541,7 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, accID uint, c
 	}
 
 	// 4. Fallback: Search account's joined dialogs by title or username
-	dialogsRes, errDlg := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{Limit: 200})
+	dialogsRes, errDlg := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}, Limit: 200})
 	if errDlg == nil && dialogsRes != nil {
 		var chats []tg.ChatClass
 		if d, ok := dialogsRes.(*tg.MessagesDialogs); ok {
@@ -578,8 +578,9 @@ func (e *TelethonEngine) ResolveAndJoinTarget(ctx context.Context, accID uint, c
 func (e *TelethonEngine) LeaveUnassignedGroups(ctx context.Context, client *telegram.Client, sessionName string, assignedChatIDs map[int64]bool) {
 	api := client.API()
 
-	dialogsRes, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{Limit: 200})
+	dialogsRes, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{OffsetPeer: &tg.InputPeerEmpty{}, Limit: 200})
 	if err != nil || dialogsRes == nil {
+		log.Printf("⚠️ Listener '%s' failed to fetch dialogs for unassigned group check: %v", sessionName, err)
 		return
 	}
 
@@ -590,6 +591,7 @@ func (e *TelethonEngine) LeaveUnassignedGroups(ctx context.Context, client *tele
 		chats = ds.Chats
 	}
 
+	leftCount := 0
 	for _, chat := range chats {
 		if ch, ok := chat.(*tg.Channel); ok {
 			chatID := -1000000000000 - ch.ID
@@ -600,14 +602,38 @@ func (e *TelethonEngine) LeaveUnassignedGroups(ctx context.Context, client *tele
 						AccessHash: ch.AccessHash,
 					})
 					if errLeave == nil {
-						log.Printf("🧹 Listener '%s' left unassigned group '%s' (chat_id: %d)", sessionName, ch.Title, chatID)
+						leftCount++
+						log.Printf("🧹 Listener '%s' left unassigned supergroup/channel '%s' (chat_id: %d)", sessionName, ch.Title, chatID)
 					} else {
 						log.Printf("⚠️ Listener '%s' failed to leave unassigned group '%s': %v", sessionName, ch.Title, errLeave)
 					}
 					time.Sleep(500 * time.Millisecond)
 				}
 			}
+		} else if c, ok := chat.(*tg.Chat); ok {
+			chatID := -c.ID
+			if !assignedChatIDs[chatID] && !assignedChatIDs[c.ID] {
+				if !c.Deactivated {
+					_, errLeave := api.MessagesDeleteChatUser(ctx, &tg.MessagesDeleteChatUserRequest{
+						ChatID: c.ID,
+						UserID: &tg.InputUserSelf{},
+					})
+					if errLeave == nil {
+						leftCount++
+						log.Printf("🧹 Listener '%s' left unassigned basic group '%s' (chat_id: %d)", sessionName, c.Title, chatID)
+					} else {
+						log.Printf("⚠️ Listener '%s' failed to leave basic group '%s': %v", sessionName, c.Title, errLeave)
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+			}
 		}
+	}
+
+	if leftCount > 0 {
+		log.Printf("🧹 Listener '%s' completed unassigned group cleanup: left %d group(s)", sessionName, leftCount)
+	} else {
+		log.Printf("🧹 Listener '%s' dialog check complete: %d joined group(s) checked, 0 unassigned groups to leave", sessionName, len(chats))
 	}
 }
 

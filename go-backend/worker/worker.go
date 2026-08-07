@@ -261,11 +261,9 @@ func (w *WorkerNode) setupListeners() {
 		}
 
 		// Leave any unassigned groups for this listener account
-		if len(assignedChatIDs) > 0 {
-			ctxLeave, cancelLeave := context.WithTimeout(context.Background(), 30*time.Second)
-			telethon.Engine.LeaveUnassignedGroups(ctxLeave, entry.Client, acc.SessionName, assignedChatIDs)
-			cancelLeave()
-		}
+		ctxLeave, cancelLeave := context.WithTimeout(context.Background(), 30*time.Second)
+		telethon.Engine.LeaveUnassignedGroups(ctxLeave, entry.Client, acc.SessionName, assignedChatIDs)
+		cancelLeave()
 
 		log.Printf("✅ Listener '%s' active and monitoring assigned groups", acc.SessionName)
 	}
@@ -501,6 +499,11 @@ func (w *WorkerNode) consumerLoop(ctx context.Context) {
 				continue
 			}
 
+			if len(msgs) == 0 {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
 			job, ok := queue.Instance.DequeueMessage(1)
 			if !ok || job == nil {
 				now := time.Now().Unix()
@@ -509,13 +512,6 @@ func (w *WorkerNode) consumerLoop(ctx context.Context) {
 					w.refreshReplierAssignments()
 					w.lastListenerRefresh = now
 				}
-				continue
-			}
-
-			if len(msgs) == 0 {
-				log.Printf("⚠️ [%s] No messages available. Re-queueing job.", w.WorkerID)
-				queue.Instance.RequeueForRetry(*job)
-				time.Sleep(1 * time.Second)
 				continue
 			}
 

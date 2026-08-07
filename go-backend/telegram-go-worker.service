@@ -9,7 +9,7 @@ User=telegram
 
 WorkingDirectory=/home/telegram/Telegram-Client/go-backend
 
-ExecStart=/home/telegram/Telegram-Client/go-backend/bin/server
+ExecStart=/home/telegram/Telegram-Client/go-backend/bin/worker
 
 Restart=always
 RestartSec=5
