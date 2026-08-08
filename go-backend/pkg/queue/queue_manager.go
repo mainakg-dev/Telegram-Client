@@ -694,3 +694,46 @@ func (qm *QueueManager) GetConsumerAndMessages() (string, []string) {
 	}
 	return consumer, qm.memMessages
 }
+
+// ─── Per-Account Rate Limiting ───────────────────────────────────
+
+// CheckAndIncrRateLimit checks if the account is under the rate limit (maxPerMinute).
+// If under limit, increments the counter and returns true.
+// If at or over limit, returns false without incrementing.
+func (qm *QueueManager) CheckAndIncrRateLimit(sessionName string, maxPerMinute int) bool {
+	key := fmt.Sprintf("rate_limit:%s", sessionName)
+
+	if qm.useRedis && qm.redisClient != nil {
+		ctx := context.Background()
+
+		// Check current count first
+		current, err := qm.redisClient.Get(ctx, key).Int()
+		if err == nil && current >= maxPerMinute {
+			return false
+		}
+
+		// Increment and set TTL
+		newVal, err := qm.redisClient.Incr(ctx, key).Result()
+		if err != nil {
+			return true // fail open
+		}
+
+		// Set expiry only on first increment (when key is new)
+		if newVal == 1 {
+			qm.redisClient.Expire(ctx, key, 60*time.Second)
+		}
+
+		return newVal <= int64(maxPerMinute)
+	}
+
+	// In-memory fallback
+	qm.mu.Lock()
+	defer qm.mu.Unlock()
+	memKey := "rate:" + sessionName
+	count := qm.memConsecutive[memKey]
+	if count >= maxPerMinute {
+		return false
+	}
+	qm.memConsecutive[memKey] = count + 1
+	return true
+}

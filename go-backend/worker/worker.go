@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -21,6 +22,20 @@ import (
 	"github.com/gotd/td/tg"
 )
 
+type debounceMsg struct {
+	chatID       int64
+	msgID        int
+	text         string
+	senderID     int64
+	senderName   string
+	replyToMsgID *int
+}
+
+type debounceEntry struct {
+	messages []debounceMsg
+	timer    *time.Timer
+}
+
 type WorkerNode struct {
 	WorkerID             string
 	ServerGroup          int
@@ -32,6 +47,9 @@ type WorkerNode struct {
 	selfIDs              map[int64]bool
 	replySemaphore       chan struct{}
 	lastListenerRefresh  int64
+	debounceMu           sync.Mutex
+	debounceBuffers      map[int64]*debounceEntry
+	roundRobinCounters   map[string]uint64
 }
 
 func main() {
@@ -65,6 +83,8 @@ func main() {
 		replierAccountsCache: make(map[string]db.Account),
 		selfIDs:              make(map[int64]bool),
 		replySemaphore:       make(chan struct{}, maxReplies),
+		debounceBuffers:      make(map[int64]*debounceEntry),
+		roundRobinCounters:   make(map[string]uint64),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -198,8 +218,72 @@ func (w *WorkerNode) handleIncomingMessage(msg *tg.Message, handlerStartTime int
 	}
 
 	senderName := fmt.Sprintf("%d", senderID)
-	queue.Instance.EnqueueMessage(chatID, msg.ID, text, senderID, senderName, replyToMsgID)
-	log.Printf("⚡ [%s] Detected & Enqueued msg #%d in chat %d from %s", w.WorkerID, msg.ID, chatID, senderName)
+	w.addToDebounceBuffer(chatID, msg.ID, text, senderID, senderName, replyToMsgID)
+	log.Printf("⚡ [%s] Detected msg #%d in chat %d from %s (buffered for debounce)", w.WorkerID, msg.ID, chatID, senderName)
+}
+
+func (w *WorkerNode) addToDebounceBuffer(chatID int64, msgID int, text string, senderID int64, senderName string, replyToMsgID *int) {
+	w.debounceMu.Lock()
+	defer w.debounceMu.Unlock()
+
+	entry, exists := w.debounceBuffers[chatID]
+	if !exists {
+		entry = &debounceEntry{
+			messages: make([]debounceMsg, 0),
+		}
+		w.debounceBuffers[chatID] = entry
+
+		// Start 3-second debounce window
+		entry.timer = time.AfterFunc(3*time.Second, func() {
+			w.flushDebounceBuffer(chatID)
+		})
+	}
+
+	entry.messages = append(entry.messages, debounceMsg{
+		chatID:       chatID,
+		msgID:        msgID,
+		text:         text,
+		senderID:     senderID,
+		senderName:   senderName,
+		replyToMsgID: replyToMsgID,
+	})
+}
+
+func (w *WorkerNode) flushDebounceBuffer(chatID int64) {
+	w.debounceMu.Lock()
+	entry, exists := w.debounceBuffers[chatID]
+	if !exists || len(entry.messages) == 0 {
+		delete(w.debounceBuffers, chatID)
+		w.debounceMu.Unlock()
+		return
+	}
+	msgs := make([]debounceMsg, len(entry.messages))
+	copy(msgs, entry.messages)
+	delete(w.debounceBuffers, chatID)
+	w.debounceMu.Unlock()
+
+	// Select 40% of messages randomly (minimum 1)
+	selectCount := int(math.Ceil(float64(len(msgs)) * 0.4))
+	if selectCount < 1 {
+		selectCount = 1
+	}
+	if selectCount > len(msgs) {
+		selectCount = len(msgs)
+	}
+
+	rand.Shuffle(len(msgs), func(i, j int) {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	})
+
+	selected := msgs[:selectCount]
+	dropped := len(msgs) - selectCount
+
+	for _, m := range selected {
+		queue.Instance.EnqueueMessage(m.chatID, m.msgID, m.text, m.senderID, m.senderName, m.replyToMsgID)
+	}
+
+	log.Printf("🎯 [%s] Debounce flush chat %d: %d msgs in 3s window → enqueued %d (40%%), dropped %d",
+		w.WorkerID, chatID, len(msgs), selectCount, dropped)
 }
 
 func (w *WorkerNode) setupListeners() {
@@ -413,29 +497,65 @@ func (w *WorkerNode) findPrimaryAndBackupForChat(chatID int64) (*db.Account, *db
 	return primaryAcc, backupAcc
 }
 
-// Fix #3: Removed per-group lock. Replies to different messages in the same group
-// can now proceed in parallel. Only the global semaphore limits concurrency.
+// dispatchReply uses round-robin account selection with per-account rate limiting.
+// No requeue on failure — all excess/failed messages are dropped.
 func (w *WorkerNode) dispatchReply(ctx context.Context, job queue.MessagePayload, msgToSend string) {
 	primaryAcc, backupAcc := w.findPrimaryAndBackupForChat(job.ChatID)
 
-	var chosenAcc *db.Account
-	isBackup := false
+	// Build list of healthy (non-flood-waited) accounts
+	type candidate struct {
+		acc      *db.Account
+		isBackup bool
+	}
+	healthy := make([]candidate, 0, 2)
 
 	if primaryAcc != nil && primaryAcc.Status != "FLOOD_WAIT" && primaryAcc.Status != "UNAUTHORIZED" && primaryAcc.Status != "DISABLED" && primaryAcc.Status != "ERROR" {
-		chosenAcc = primaryAcc
-	} else if backupAcc != nil && backupAcc.Status != "FLOOD_WAIT" && backupAcc.Status != "UNAUTHORIZED" && backupAcc.Status != "DISABLED" && backupAcc.Status != "ERROR" {
-		chosenAcc = backupAcc
-		isBackup = true
-		log.Printf("🔄 Primary account unavailable/floodwaited for chat %d. Failing over to Backup account %s", job.ChatID, backupAcc.Phone)
-	} else if primaryAcc != nil {
-		chosenAcc = primaryAcc
+		healthy = append(healthy, candidate{acc: primaryAcc, isBackup: false})
+	}
+	if backupAcc != nil && backupAcc.Status != "FLOOD_WAIT" && backupAcc.Status != "UNAUTHORIZED" && backupAcc.Status != "DISABLED" && backupAcc.Status != "ERROR" {
+		if primaryAcc == nil || backupAcc.SessionName != primaryAcc.SessionName {
+			healthy = append(healthy, candidate{acc: backupAcc, isBackup: true})
+		}
 	}
 
-	if chosenAcc == nil {
-		log.Printf("⚠️ [%s] No assigned replier for chat %d. Dropping job.", w.WorkerID, job.ChatID)
+	if len(healthy) == 0 {
+		log.Printf("⚠️ [%s] All accounts unavailable for chat %d. Dropping msg #%d.", w.WorkerID, job.ChatID, job.MsgID)
 		return
 	}
 
+	// Round-robin selection based on per-target counter
+	w.mu.Lock()
+	targetStr := w.chatIDToTarget[job.ChatID]
+	if targetStr == "" {
+		targetStr = w.chatIDToTarget[-job.ChatID]
+	}
+	counter := w.roundRobinCounters[targetStr]
+	w.roundRobinCounters[targetStr] = counter + 1
+	w.mu.Unlock()
+
+	chosenIdx := int(counter) % len(healthy)
+	chosen := healthy[chosenIdx]
+
+	// Rate limit check (10 msgs/min per account)
+	if !queue.Instance.CheckAndIncrRateLimit(chosen.acc.SessionName, 10) {
+		// Try the other account
+		if len(healthy) > 1 {
+			altIdx := (chosenIdx + 1) % len(healthy)
+			chosen = healthy[altIdx]
+			if !queue.Instance.CheckAndIncrRateLimit(chosen.acc.SessionName, 10) {
+				log.Printf("⚠️ [%s] Both accounts rate-limited (10/min) for chat %d. Dropping msg #%d.", w.WorkerID, job.ChatID, job.MsgID)
+				queue.Instance.PushWorkerLog("AUTO_REPLY", "WARNING", fmt.Sprintf("Dropped msg #%d in chat %d: both accounts hit 10/min rate limit", job.MsgID, job.ChatID), "", 0, fmt.Sprintf("%d", job.ChatID))
+				return
+			}
+		} else {
+			log.Printf("⚠️ [%s] Account %s rate-limited (10/min), no backup for chat %d. Dropping msg #%d.", w.WorkerID, chosen.acc.Phone, job.ChatID, job.MsgID)
+			queue.Instance.PushWorkerLog("AUTO_REPLY", "WARNING", fmt.Sprintf("Dropped msg #%d in chat %d: account rate-limited", job.MsgID, job.ChatID), chosen.acc.Phone, chosen.acc.ServerGroup, fmt.Sprintf("%d", job.ChatID))
+			return
+		}
+	}
+
+	chosenAcc := chosen.acc
+	isBackup := chosen.isBackup
 	sessionName := chosenAcc.SessionName
 
 	// Rule 4: Backup account will NOT reply to a message that is itself a reply
@@ -449,16 +569,14 @@ func (w *WorkerNode) dispatchReply(ctx context.Context, job queue.MessagePayload
 	if job.IsReply {
 		consecutiveCount := queue.Instance.GetConsecutiveThreadReplies(job.ChatID, sessionName)
 		if consecutiveCount >= 5 {
-			log.Printf("⚠️ Reached max consecutive thread replies (5) for account %s in chat %d. Skipping msg #%d.", chosenAcc.Phone, job.ChatID, job.MsgID)
-			queue.Instance.PushWorkerLog("AUTO_REPLY", "WARNING", fmt.Sprintf("Skipped msg #%d in chat %d: Reached max 5 consecutive thread replies", job.MsgID, job.ChatID), chosenAcc.Phone, chosenAcc.ServerGroup, fmt.Sprintf("%d", job.ChatID))
+			log.Printf("⚠️ Reached max consecutive thread replies (5) for account %s in chat %d. Dropping msg #%d.", chosenAcc.Phone, job.ChatID, job.MsgID)
 			return
 		}
 	} else {
 		queue.Instance.ResetConsecutiveThreadReplies(job.ChatID, sessionName)
 	}
 
-	// Fix #7: Fire typing indicator immediately BEFORE acquiring semaphore.
-	// This way "typing..." appears to users while we wait for a concurrency slot.
+	// Fire typing indicator immediately BEFORE acquiring semaphore
 	go telethon.Engine.FireTypingIndicator(chosenAcc.ID, job.ChatID)
 
 	// Acquire global semaphore (limits total concurrent replies)
@@ -476,12 +594,51 @@ func (w *WorkerNode) dispatchReply(ctx context.Context, job queue.MessagePayload
 		if isBackup {
 			accRoleStr = "backup"
 		}
-		log.Printf("✅ [%s] Replied to msg #%d in chat %d via %s replier %s", w.WorkerID, job.MsgID, job.ChatID, accRoleStr, chosenAcc.Phone)
-		queue.Instance.PushWorkerLog("AUTO_REPLY", "SUCCESS", fmt.Sprintf("Replied to msg #%d in chat %d (%s replier)", job.MsgID, job.ChatID, accRoleStr), chosenAcc.Phone, chosenAcc.ServerGroup, fmt.Sprintf("%d", job.ChatID))
+		log.Printf("✅ [%s] Replied to msg #%d in chat %d via %s replier %s (round-robin #%d)", w.WorkerID, job.MsgID, job.ChatID, accRoleStr, chosenAcc.Phone, counter)
+		queue.Instance.PushWorkerLog("AUTO_REPLY", "SUCCESS", fmt.Sprintf("Replied to msg #%d in chat %d (%s replier, RR#%d)", job.MsgID, job.ChatID, accRoleStr, counter), chosenAcc.Phone, chosenAcc.ServerGroup, fmt.Sprintf("%d", job.ChatID))
 	} else {
-		log.Printf("⚠️ Replier %s failed for chat %d. Re-queueing.", chosenAcc.Phone, job.ChatID)
-		queue.Instance.RequeueForRetry(job)
+		// NO REQUEUE — drop on failure
+		log.Printf("⚠️ [%s] Replier %s failed for chat %d msg #%d. Dropping (no requeue).", w.WorkerID, chosenAcc.Phone, job.ChatID, job.MsgID)
+		queue.Instance.PushWorkerLog("AUTO_REPLY", "WARNING", fmt.Sprintf("Failed and dropped msg #%d in chat %d (no requeue)", job.MsgID, job.ChatID), chosenAcc.Phone, chosenAcc.ServerGroup, fmt.Sprintf("%d", job.ChatID))
 	}
+}
+
+// refreshReplierAccountStatuses reloads fresh account status from SQLite into the
+// in-memory replier cache so pre-dequeue health checks use up-to-date data.
+func (w *WorkerNode) refreshReplierAccountStatuses() {
+	w.mu.Lock()
+	sessionNames := make([]string, 0, len(w.replierAccountsCache))
+	for sn := range w.replierAccountsCache {
+		sessionNames = append(sessionNames, sn)
+	}
+	w.mu.Unlock()
+
+	if len(sessionNames) == 0 {
+		return
+	}
+
+	var freshAccounts []db.Account
+	db.DB.Where("session_name IN ?", sessionNames).Find(&freshAccounts)
+
+	w.mu.Lock()
+	for _, acc := range freshAccounts {
+		w.replierAccountsCache[acc.SessionName] = acc
+	}
+	w.mu.Unlock()
+}
+
+// allRepliersUnavailable returns true if every cached replier account is in a
+// non-sendable state (FLOOD_WAIT, UNAUTHORIZED, DISABLED, ERROR).
+func (w *WorkerNode) allRepliersUnavailable() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, acc := range w.replierAccountsCache {
+		if acc.Status != "FLOOD_WAIT" && acc.Status != "UNAUTHORIZED" && acc.Status != "DISABLED" && acc.Status != "ERROR" {
+			return false // at least one healthy
+		}
+	}
+	return true
 }
 
 func (w *WorkerNode) consumerLoop(ctx context.Context) {
@@ -492,7 +649,7 @@ func (w *WorkerNode) consumerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			// Fix #6: Pipeline — fetch active_consumer + active_messages in single Redis round-trip
+			// Pipeline — fetch active_consumer + active_messages in single Redis round-trip
 			activeConsumer, msgs := queue.Instance.GetConsumerAndMessages()
 			if activeConsumer != w.WorkerID {
 				time.Sleep(2 * time.Second)
@@ -501,6 +658,15 @@ func (w *WorkerNode) consumerLoop(ctx context.Context) {
 
 			if len(msgs) == 0 {
 				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			// Pre-dequeue check: refresh account statuses and skip dequeue
+			// if ALL replier accounts are unavailable
+			w.refreshReplierAccountStatuses()
+			if w.allRepliersUnavailable() {
+				log.Printf("⏸️ [%s] All replier accounts are FLOOD_WAIT or unavailable. Sleeping.", w.WorkerID)
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
